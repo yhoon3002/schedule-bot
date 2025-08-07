@@ -13,7 +13,7 @@
                     :class="[
                         'rounded-lg px-4 py-2 max-w-md break-words whitespace-pre-line text-left',
                         msg.role === 'user'
-                            ? 'bg-blue-500 text-white'
+                            ? 'bg-[#646CFF] text-white'
                             : 'bg-white border border-gray-300 text-gray-800',
                     ]"
                 >
@@ -29,12 +29,13 @@
                     ref="inputBox"
                     rows="1"
                     class="flex-1 resize-none overflow-y-auto max-h-40 border rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-400"
+                    style="scrollbar-width: none"
                     placeholder="메시지를 입력하세요..."
                     @input="autoResize"
                 ></textarea>
                 <button
                     type="submit"
-                    class="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600"
+                    class="px-4 py-2 bg-[#646CFF] text-white rounded-md hover:bg-blue-600"
                 >
                     전송
                 </button>
