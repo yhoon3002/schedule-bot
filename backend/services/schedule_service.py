@@ -1,26 +1,15 @@
-from schemas.schedule_schema import ScheduleInput, ScheduleResponse
-from models.schedule import Schedule
-from sqlalchemy.orm import Session
+from schemas.schedule_schema import ScheduleParseRequest, ScheduleParseResponse
 from datetime import datetime
 
-def parse_and_save_schedule(payload: ScheduleInput, db: Session) -> ScheduleResponse:
-    # TODO: OpenAI API 연동 → GPT로 시간/제목 추출
-    dummy_title = "회의"
-    dummy_start = datetime.now()
-    dummy_end = datetime.now()
+def parse_schedule(request: ScheduleParseRequest) -> ScheduleParseResponse:
+    # GPT 대신 하드코딩 로직
+    if "회의" in request.text:
+        return ScheduleParseResponse(
+            title="영훈이와 회의",
+            datetime=datetime(2025, 8, 14, 15, 0)
+        )
 
-    schedule = Schedule(
-        title=dummy_title,
-        start_time=dummy_start,
-        end_time=dummy_end,
-    )
-
-    db.add(schedule)
-    db.commit()
-    db.refresh(schedule)
-
-    return ScheduleResponse(
-        title=schedule.title,
-        start_time=schedule.start_time,
-        end_time=schedule.end_time,
+    return ScheduleParseResponse(
+        title="일정 없음",
+        datetime=datetime.now()
     )

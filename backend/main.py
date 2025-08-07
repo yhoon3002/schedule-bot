@@ -1,18 +1,17 @@
 from fastapi import FastAPI
+from routes import schedule
 from fastapi.middleware.cors import CORSMiddleware
-from routes.schedule import router as schedule_router
-from database import Base, engine
-
-Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
+# Cors
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Vite 개발용 포트
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
-app.include_router(schedule_router, prefix="/schedule", tags=["Schedule"])
+# 라우터 등록
+app.include_router(schedule.router)

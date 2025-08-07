@@ -1,10 +1,9 @@
 from pydantic import BaseModel
 from datetime import datetime
 
-class ScheduleInput(BaseModel):
+class ScheduleParseRequest(BaseModel):
     text: str
 
-class ScheduleResponse(BaseModel):
+class ScheduleParseResponse(BaseModel):
     title: str
-    start_time: datetime
-    end_time: datetime
+    datetime: datetime

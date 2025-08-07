@@ -45,6 +45,8 @@
 </template>
 
 <script lang="ts">
+import { parseSchedule } from "../api/parse_schedule";
+
 export default {
     data() {
         return {
@@ -72,12 +74,11 @@ export default {
             textarea.style.height = Math.min(textarea.scrollHeight, 160) + "px"; // 최대 높이 제한
         },
 
-        sendMessage() {
+        async sendMessage() {
             const content = this.userInput.trim();
             if (!content) return;
 
             this.messages.push({ role: "user", content });
-
             this.userInput = "";
 
             this.$nextTick(() => {
@@ -88,13 +89,23 @@ export default {
                 this.scrollToBottom();
             });
 
-            setTimeout(() => {
+            try {
+                const { title, datetime } = await parseSchedule(content);
+
                 this.messages.push({
                     role: "assistant",
-                    content: "좋습니다. 다음 질문으로 넘어갈게요!",
+                    content: `"${title}" 일정을 ${new Date(
+                        datetime
+                    ).toLocaleString()}에 등록할게요!`,
                 });
+            } catch (error) {
+                this.messages.push({
+                    role: "assistant",
+                    content: "일정 파싱에 실패했습니다. 다시 시도해주세요.",
+                });
+            } finally {
                 this.scrollToBottom();
-            }, 800);
+            }
         },
 
         scrollToBottom() {
