@@ -7,12 +7,13 @@ from routes.google_oauth import router as google_auth_router
 from routes.google_calendar import router as google_calendar_router
 
 app = FastAPI()
+WEB_ORIGIN = os.getenv("WEB_ORIGIN", "")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        os.getenv("WEB_ORIGIN", ""),
+        WEB_ORIGIN
     ],
     allow_credentials=True,
     allow_methods=["*"],
