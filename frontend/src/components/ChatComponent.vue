@@ -23,7 +23,7 @@
         </div>
 
         <div class="border-t border-gray-200 p-4 bg-white">
-            <form @submit.prevent="sendMessage" class="flex gap-2">
+            <form @submit.prevent="onFormSubmit" class="flex gap-2">
                 <textarea
                     v-model="userInput"
                     ref="inputBox"
@@ -32,10 +32,15 @@
                     style="scrollbar-width: none"
                     placeholder="메시지를 입력하세요..."
                     @input="autoResize"
+                    @keydown.enter.exact.prevent="onEnter"
+                    @compositionstart="isComposing = true"
+                    @compositionend="isComposing = false"
                 ></textarea>
+
                 <button
                     type="submit"
-                    class="px-4 py-2 bg-[#646CFF] text-white rounded-md hover:bg-blue-600"
+                    class="px-4 py-2 bg-[#646CFF] text-white rounded-md hover:bg-blue-600 disabled:opacity-50"
+                    :disabled="isSending || !userInput.trim()"
                 >
                     전송
                 </button>
@@ -45,81 +50,85 @@
 </template>
 
 <script lang="ts">
-import { parseSchedule } from "../api/parse_schedule";
+import { defineComponent, nextTick } from "vue";
+import { chatSchedule } from "../api/chat_schedule";
 
-export default {
+type ChatMsg = { role: "user" | "assistant"; content: string };
+
+export default defineComponent({
+    name: "ChatComponent",
     data() {
         return {
-            userInput: "",
-            messages: [
-                {
-                    role: "assistant",
-                    content: "안녕하세요! 무엇을 도와드릴까요?",
-                },
-                { role: "user", content: "일정 등록하고 싶어요." },
-                {
-                    role: "assistant",
-                    content: "알겠습니다. 날짜를 알려주세요!",
-                },
-            ],
+            userInput: "" as string,
+            messages: [] as ChatMsg[],
+            isSending: false,
+            isComposing: false,
         };
     },
-
     methods: {
         autoResize() {
-            const textarea = this.$refs.inputBox as HTMLTextAreaElement;
+            const textarea = this.$refs.inputBox as
+                | HTMLTextAreaElement
+                | undefined;
             if (!textarea) return;
-
-            textarea.style.height = "auto"; // 초기화
-            textarea.style.height = Math.min(textarea.scrollHeight, 160) + "px"; // 최대 높이 제한
+            textarea.style.height = "auto";
+            textarea.style.height = Math.min(textarea.scrollHeight, 160) + "px";
         },
 
-        async sendMessage() {
+        onEnter() {
+            if (this.isComposing) return;
+            this.onFormSubmit();
+        },
+
+        async onFormSubmit() {
+            if (this.isSending) return;
             const content = this.userInput.trim();
             if (!content) return;
+
+            this.isSending = true;
 
             this.messages.push({ role: "user", content });
             this.userInput = "";
 
-            this.$nextTick(() => {
-                const textarea = this.$refs.inputBox as HTMLTextAreaElement;
-                if (textarea) {
-                    textarea.style.height = "auto";
-                }
-                this.scrollToBottom();
-            });
+            await nextTick();
+            const textarea = this.$refs.inputBox as
+                | HTMLTextAreaElement
+                | undefined;
+            if (textarea) textarea.style.height = "auto";
+            this.scrollToBottom();
 
             try {
-                const { title, datetime } = await parseSchedule(content);
-
-                this.messages.push({
-                    role: "assistant",
-                    content: `"${title}" 일정을 ${new Date(
-                        datetime
-                    ).toLocaleString()}에 등록할게요!`,
+                const { reply } = await chatSchedule({
+                    user_message: content,
+                    history: this.messages
+                        .slice(0, -1)
+                        .map(({ role, content }) => ({ role, content })),
                 });
-            } catch (error) {
+
+                this.messages.push({ role: "assistant", content: reply });
+            } catch (e) {
                 this.messages.push({
                     role: "assistant",
-                    content: "일정 파싱에 실패했습니다. 다시 시도해주세요.",
+                    content:
+                        "처리 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
                 });
             } finally {
+                this.isSending = false;
                 this.scrollToBottom();
             }
         },
 
         scrollToBottom() {
-            this.$nextTick(() => {
-                const container = this.$refs.chatBody as HTMLElement;
-                if (container) {
-                    container.scrollTop = container.scrollHeight;
-                }
+            nextTick(() => {
+                const container = this.$refs.chatBody as
+                    | HTMLElement
+                    | undefined;
+                if (container) container.scrollTop = container.scrollHeight;
             });
         },
     },
-
     mounted() {
         this.scrollToBottom();
     },
-};
+});
 </script>
