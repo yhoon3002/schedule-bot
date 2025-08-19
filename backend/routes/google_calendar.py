@@ -1,8 +1,9 @@
 import logging, requests
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Body
 from routes.google_oauth import _refresh
+
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/google/calendar", tags=["google-calendar"])
@@ -10,11 +11,9 @@ router = APIRouter(prefix="/google/calendar", tags=["google-calendar"])
 GCAL_BASE = "https://www.googleapis.com/calendar/v3"
 KST = timezone(timedelta(hours=9))
 
-
 def _auth_header(session_id: str) -> Dict[str, str]:
     tok = _refresh(session_id)
     return {"Authorization": f"Bearer {tok['access_token']}"}
-
 
 def _rfc3339(dt: datetime) -> str:
     return (
@@ -24,14 +23,12 @@ def _rfc3339(dt: datetime) -> str:
         .replace("+00:00", "Z")
     )
 
-
 def _normalize_rfc3339(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
     if "Z" in s or "+" in s or "-" in s[11:]:
         return s
     return s + "Z"
-
 
 # ---- 캘린더 리스트 ----
 def gcal_list_calendar_list(session_id: str) -> List[Dict[str, Any]]:
@@ -44,7 +41,6 @@ def gcal_list_calendar_list(session_id: str) -> List[Dict[str, Any]]:
     selected = [c for c in items if c.get("selected")]
     return selected or items
 
-
 def _cal_type(cal: Dict[str, Any]) -> str:
     cid = (cal.get("id") or "").lower()
     summary = (cal.get("summaryOverride") or cal.get("summary") or "").lower()
@@ -53,7 +49,6 @@ def _cal_type(cal: Dict[str, Any]) -> str:
     if cid.startswith("addressbook#") or "birthday" in cid or "birthdays" in summary:
         return "birthday"
     return "normal"
-
 
 # ---- 개별 캘린더 이벤트 조회 ----
 def _list_events_for_calendar(
@@ -88,55 +83,6 @@ def _list_events_for_calendar(
         it["_calendarId"] = calendar_id
     return items
 
-
-# ============== 참석자 정규화 ==============
-def _norm_attendees_for_write(v):
-    """
-    attendees 입력을 일관된 형태로 정규화한다.
-    - "a@b.com" -> [{"email": "a@b.com"}]
-    - {"email": "a@b.com", "displayName": "..."} -> 그대로 반영
-    - 리스트면 각 원소에 대해 위 규칙 적용
-    - None => None (패치 시 '변경하지 않음')
-    - []   => []   (패치 시 '모두 제거')
-    """
-    if v is None:
-        return None
-    if not isinstance(v, list):
-        v = [v]
-    out = []
-    for x in v:
-        if not x:
-            continue
-        if isinstance(x, str):
-            email = x.strip()
-            if email:
-                out.append({"email": email})
-        elif isinstance(x, dict):
-            email = (x.get("email") or x.get("value") or x.get("address") or "").strip()
-            if email:
-                item = {"email": email}
-                dn = x.get("displayName") or x.get("name")
-                if dn:
-                    item["displayName"] = dn
-                out.append(item)
-    return out
-
-
-def _as_send_updates(v: Optional[bool | str]) -> Optional[str]:
-    """
-    True/False/None 또는 'all'/'none'/'externalOnly' 를
-    Google API의 sendUpdates 값으로 변환.
-    """
-    if v is None:
-        return None
-    if isinstance(v, bool):
-        return "all" if v else "none"
-    v = v.strip().lower()
-    if v in {"all", "none", "externalonly"}:
-        return "externalOnly" if v == "externalonly" else v
-    return None
-
-
 # ---- 모든 캘린더에서 모아오기 (기본: 오늘~연말 KST, 공휴일/생일 제외) ----
 def gcal_list_events_all(
     session_id: str,
@@ -153,8 +99,18 @@ def gcal_list_events_all(
         time_min = _rfc3339(today_start_kst)
         time_max = _rfc3339(end_of_year_kst)
 
+    logger.info(
+        "[GCAL] list all: timeMin=%s, timeMax=%s, q=%s, incHol=%s, incBday=%s",
+        time_min,
+        time_max,
+        query,
+        include_holidays,
+        include_birthdays,
+    )
+
     calendars = gcal_list_calendar_list(session_id)
     if not calendars:
+        logger.warning("[GCAL] calendarList empty")
         return []
 
     filtered: List[Dict[str, Any]] = []
@@ -171,8 +127,7 @@ def gcal_list_events_all(
         cid = cal.get("id") or "primary"
         try:
             items = _list_events_for_calendar(session_id, cid, time_min, time_max, query)
-            for it in items:
-                it["_calendarId"] = cid
+            logger.info("[GCAL] %s -> %d items", cid, len(items))
             all_items.extend(items)
         except HTTPException:
             continue
@@ -183,7 +138,6 @@ def gcal_list_events_all(
 
     all_items.sort(key=_start_key)
     return all_items
-
 
 # ---- 단건 조회/CRUD ----
 def gcal_get_event(session_id: str, calendar_id: str, event_id: str) -> Dict[str, Any]:
@@ -206,12 +160,11 @@ def gcal_get_event(session_id: str, calendar_id: str, event_id: str) -> Dict[str
     item["_calendarId"] = calendar_id
     return item
 
-
 def gcal_insert_event(
     session_id: str,
     body: Dict[str, Any],
     calendar_id: str = "primary",
-    send_updates: Optional[bool | str] = None,
+    send_updates: Optional[str] = None,  # "all" | "none" | None
 ) -> Dict[str, Any]:
     headers = _auth_header(session_id)
 
@@ -246,9 +199,8 @@ def gcal_insert_event(
             payload["attendees"] = att
 
     params = {}
-    su = _as_send_updates(send_updates)
-    if su:
-        params["sendUpdates"] = su
+    if send_updates:
+        params["sendUpdates"] = send_updates
 
     r = requests.post(
         f"{GCAL_BASE}/calendars/{calendar_id}/events",
@@ -264,13 +216,12 @@ def gcal_insert_event(
     item["_calendarId"] = calendar_id
     return item
 
-
 def gcal_patch_event(
     session_id: str,
     event_id: str,
     body: Dict[str, Any],
     calendar_id: str = "primary",
-    send_updates: Optional[bool | str] = None,
+    send_updates: Optional[str] = None,  # "all" | "none" | None
 ) -> Dict[str, Any]:
     headers = _auth_header(session_id)
     b = dict(body)
@@ -298,14 +249,13 @@ def gcal_patch_event(
         payload["location"] = b["location"]
     if "attendees" in b:
         att = _norm_attendees_for_write(b.get("attendees"))
-        # None -> 변경하지 않음, [] -> 전부 제거
+        # None -> 변경안함, [] -> 전부 제거, [{email..}] -> 설정
         if att is not None:
             payload["attendees"] = att
 
     params = {}
-    su = _as_send_updates(send_updates)
-    if su:
-        params["sendUpdates"] = su
+    if send_updates:
+        params["sendUpdates"] = send_updates
 
     r = requests.patch(
         f"{GCAL_BASE}/calendars/{calendar_id}/events/{event_id}",
@@ -321,7 +271,6 @@ def gcal_patch_event(
     item["_calendarId"] = calendar_id
     return item
 
-
 def gcal_delete_event(
     session_id: str, event_id: str, calendar_id: str = "primary"
 ) -> None:
@@ -335,7 +284,7 @@ def gcal_delete_event(
         logger.error("Delete event failed: %s | %s", r.status_code, r.text)
         raise HTTPException(502, "Google Calendar delete failed")
 
-
+# ================== REST (옵션) ==================
 @router.get("/events")
 def list_events(
     session_id: str = Query(...),
@@ -346,4 +295,102 @@ def list_events(
     include_birthdays: bool = Query(False),
 ):
     items = gcal_list_events_all(session_id, timeMin, timeMax, q, include_holidays, include_birthdays)
+    logger.info("[GCAL] REST /events -> %d items", len(items))
     return {"items": items}
+
+@router.get("/events/{event_id}")
+def get_event(
+    event_id: str,
+    session_id: str = Query(...),
+    calendar_id: str = Query("primary"),
+):
+    return gcal_get_event(session_id, calendar_id, event_id)
+
+@router.post("/events")
+def create_event(
+    body: Dict[str, Any] = Body(...),
+    session_id: str = Query(...),
+    calendar_id: str = Query("primary"),
+    send_updates: Optional[str] = Query(None, regex="^(all|none)?$"),
+):
+    """
+    body 예시:
+    {
+      "summary": "회의",
+      "start": {"dateTime":"2025-08-19T13:00:00+09:00"},
+      "end":   {"dateTime":"2025-08-19T14:00:00+09:00"},
+      "description": "...", "location": "...",
+      "attendees": ["a@b.com","c@d.com"]  # 문자열 or {"email":...} 형식
+    }
+    """
+    item = gcal_insert_event(session_id, body, calendar_id, send_updates)
+    return item
+
+@router.patch("/events/{event_id}")
+def patch_event(
+    event_id: str,
+    body: Dict[str, Any] = Body(...),
+    session_id: str = Query(...),
+    calendar_id: str = Query("primary"),
+    send_updates: Optional[str] = Query(None, regex="^(all|none)?$"),
+):
+    """
+    body: 부분 업데이트(같은 필드 키 그대로)
+    예) {"summary":"제목변경"} 또는 {"attendees":["a@b.com"]}
+    """
+    item = gcal_patch_event(session_id, event_id, body, calendar_id, send_updates)
+    return item
+
+# 프런트 일부가 PUT을 쓰는 경우를 대비해 동일 동작 제공(선택)
+@router.put("/events/{event_id}")
+def put_event(
+    event_id: str,
+    body: Dict[str, Any] = Body(...),
+    session_id: str = Query(...),
+    calendar_id: str = Query("primary"),
+    send_updates: Optional[str] = Query(None, regex="^(all|none)?$"),
+):
+    item = gcal_patch_event(session_id, event_id, body, calendar_id, send_updates)
+    return item
+
+@router.delete("/events/{event_id}")
+def delete_event(
+    event_id: str,
+    session_id: str = Query(...),
+    calendar_id: str = Query("primary"),
+):
+    gcal_delete_event(session_id, event_id, calendar_id)
+    return {"ok": True}
+
+
+# ---- helpers ----
+def _norm_attendees_for_write(v):
+    """
+    attendees 입력을 일관된 형태로 정규화한다.
+    - "a@b.com" -> [{"email": "a@b.com"}]
+    - {"email": "a@b.com", "displayName": "..."} -> 그대로 반영
+    - 리스트면 각 원소에 대해 위 규칙 적용
+    - None => None (패치 시 '변경하지 않음')
+    - []   => []   (패치 시 '모두 제거')
+    """
+    if v is None:
+        return None
+    if not isinstance(v, list):
+        v = [v]
+    out = []
+    for x in v:
+        if not x:
+            continue
+        if isinstance(x, str):
+            email = x.strip()
+            if email:
+                out.append({"email": email})
+        elif isinstance(x, dict):
+            email = (x.get("email") or x.get("value") or x.get("address") or "").strip()
+            if email:
+                item = {"email": email}
+                dn = x.get("displayName") or x.get("name")
+                if dn:
+                    item["displayName"] = dn
+                out.append(item)
+    return out
