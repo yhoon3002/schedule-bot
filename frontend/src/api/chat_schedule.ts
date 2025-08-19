@@ -22,14 +22,10 @@ export async function chatSchedule(
 ): Promise<ChatResponse> {
     const session_id = getSessionId();
 
-    console.log("chatSchedule session_id : ", session_id);
-
     const { data } = await axiosInstance.post<ChatResponse>("/schedules/chat", {
         ...payload,
         session_id,
     });
-
-    console.log("chatSchedule data : ", data);
 
     return data;
 }
