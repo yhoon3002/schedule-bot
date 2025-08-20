@@ -233,7 +233,7 @@ import timeGridPlugin from "@fullcalendar/timegrid";
 import interactionPlugin from "@fullcalendar/interaction";
 import koLocale from "@fullcalendar/core/locales/ko";
 
-import axiosInstance from "../utils/axios";
+import axiosInstance from "../utils/axiosInstance";
 import { getSessionId } from "../utils/session";
 import { useUserStore } from "../store/user";
 

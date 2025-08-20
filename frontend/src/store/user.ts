@@ -1,6 +1,6 @@
 // src/store/user.ts
 import { defineStore } from "pinia";
-import axios from "../utils/axios";
+import axios from "../utils/axiosInstance";
 import { getSessionId } from "../utils/session";
 
 type Profile = {

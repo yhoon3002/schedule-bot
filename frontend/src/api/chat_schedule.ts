@@ -1,4 +1,4 @@
-import axiosInstance from "../utils/axios";
+import axiosInstance from "../utils/axiosInstance";
 import { getSessionId } from "../utils/session";
 
 export interface ChatHistoryItem {

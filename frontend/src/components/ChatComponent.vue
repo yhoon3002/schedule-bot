@@ -11,13 +11,21 @@
             >
                 <div
                     :class="[
-                        'rounded-lg px-4 py-2 max-w-md break-words whitespace-pre-line text-left',
+                        'rounded-lg px-4 py-2 max-w-md break-words text-left',
                         msg.role === 'user'
                             ? 'bg-[#646CFF] text-white'
                             : 'bg-white border border-gray-300 text-gray-800',
                     ]"
                 >
-                    {{ msg.content }}
+                    <!-- assistant 메시지는 마크다운 렌더링 -->
+                    <div
+                        v-if="msg.role === 'assistant'"
+                        v-html="renderMarkdown(msg.content)"
+                    />
+                    <!-- user 메시지는 기존처럼 텍스트 -->
+                    <div v-else class="whitespace-pre-line">
+                        {{ msg.content }}
+                    </div>
                 </div>
             </div>
         </div>
@@ -53,6 +61,17 @@
 import { defineComponent, nextTick } from "vue";
 import { chatSchedule } from "../api/chat_schedule";
 
+// ✨ 추가: markdown-it + DOMPurify
+import MarkdownIt from "markdown-it";
+import DOMPurify from "dompurify";
+
+// 마크다운 파서 설정
+const md = new MarkdownIt({
+    breaks: true, // 줄바꿈 → <br>
+    linkify: true, // URL 자동 링크
+    html: false, // 원본 HTML 금지 (보안)
+});
+
 type ChatMsg = { role: "user" | "assistant"; content: string };
 
 export default defineComponent({
@@ -66,6 +85,12 @@ export default defineComponent({
         };
     },
     methods: {
+        // ✨ 추가: 마크다운 → 안전한 HTML
+        renderMarkdown(text: string) {
+            const html = md.render(text ?? "");
+            return DOMPurify.sanitize(html);
+        },
+
         autoResize() {
             const textarea = this.$refs.inputBox as
                 | HTMLTextAreaElement

@@ -1,6 +1,6 @@
 // src/store/events.ts
 import { defineStore } from "pinia";
-import axiosInstance from "../utils/axios";
+import axiosInstance from "../utils/axiosInstance";
 import { getSessionId } from "../utils/session";
 
 type FCEvent = {

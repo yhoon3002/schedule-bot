@@ -1,4 +1,4 @@
-import axiosInstance from "../utils/axios";
+import axiosInstance from "../utils/axiosInstance";
 
 export const api = {
     get: <T = any>(url: string, params?: any) =>
