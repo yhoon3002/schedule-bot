@@ -12,7 +12,6 @@ WEB_ORIGIN = os.getenv("WEB_ORIGIN", "")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",
         WEB_ORIGIN
     ],
     allow_credentials=True,

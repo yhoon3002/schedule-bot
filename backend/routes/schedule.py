@@ -1,3 +1,4 @@
+# schedules.py
 import os, re, json, logging, requests
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
@@ -24,38 +25,28 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 KST = timezone(timedelta(hours=9))
 CAL_SCOPE = "https://www.googleapis.com/auth/calendar"
 
+# ---------- 한국어 요일 ----------
+WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
+
 # -------- Email validation --------
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
 def _split_valid_invalid_attendees(v):
-    """
-    입력을 [valid_emails], [invalid_values]로 분리.
-    - "a@b.com" -> valid
-    - {"email": "a@b.com"} -> valid
-    - "영훈" -> invalid
-    - None -> ([], [])
-    """
+    """입력을 [valid_emails], [invalid_values]로 분리."""
     if v is None:
         return [], []
     if not isinstance(v, list):
         v = [v]
-
     valid, invalid = [], []
     for x in v:
         if not x:
             continue
         if isinstance(x, str):
             s = x.strip()
-            if EMAIL_RE.match(s):
-                valid.append(s)
-            else:
-                invalid.append(s)
+            (valid if EMAIL_RE.match(s) else invalid).append(s)
         elif isinstance(x, dict):
             s = (x.get("email") or x.get("value") or x.get("address") or "").strip()
-            if EMAIL_RE.match(s):
-                valid.append(s)
-            else:
-                invalid.append(s or str(x))
+            (valid if EMAIL_RE.match(s) else invalid).append(s or str(x))
         else:
             invalid.append(str(x))
     return valid, invalid
@@ -66,7 +57,7 @@ def _now_kst_iso() -> str:
 
 def _friendly_today() -> str:
     n = datetime.now(KST)
-    return n.strftime("%Y-%m-%d (%a) %H:%M")
+    return f"{n.strftime('%Y-%m-%d')} ({WEEKDAY_KO[n.weekday()]}) {n.strftime('%H:%M')}"
 
 def _must_google_connected(session_id: str):
     tok = TOKENS.get(session_id or "")
@@ -263,13 +254,23 @@ def _get_kst(dt_str: Optional[str]):
         return datetime.fromisoformat(dt_str + "T00:00:00+09:00")
     return datetime.fromisoformat(dt_str.replace("Z", "+00:00")).astimezone(KST)
 
+def _fmt_kst_date(dt: Optional[datetime]) -> str:
+    if not dt:
+        return "없음"
+    return f"{dt.strftime('%Y-%m-%d')} ({WEEKDAY_KO[dt.weekday()]})"
+
+def _fmt_kst_time(dt: Optional[datetime]) -> str:
+    if not dt:
+        return "없음"
+    return dt.strftime("%H:%M")
+
 def _line_required_g(e: dict) -> str:
     title = e.get("summary") or "(제목 없음)"
     st = _get_kst(e.get("start", {}).get("dateTime") or e.get("start", {}).get("date"))
     ed_raw = e.get("end", {}).get("dateTime") or e.get("end", {}).get("date")
     ed = _get_kst(ed_raw) if ed_raw else None
-    s = st.strftime("%Y-%m-%d (%a) %H:%M") if st else "없음"
-    e_ = ed.strftime("%Y-%m-%d (%a) %H:%M") if ed else "없음"
+    s = f"{_fmt_kst_date(st)} {_fmt_kst_time(st)}" if st else "없음"
+    e_ = f"{_fmt_kst_date(ed)} {_fmt_kst_time(ed)}" if ed else "없음"
     return f"{title}\n{s} ~ {e_}"
 
 def _fmt_detail_g(e: dict) -> str:
@@ -277,10 +278,10 @@ def _fmt_detail_g(e: dict) -> str:
     st = _get_kst(e.get("start", {}).get("dateTime") or e.get("start", {}).get("date"))
     ed_raw = e.get("end", {}).get("dateTime") or e.get("end", {}).get("date")
     ed = _get_kst(ed_raw) if ed_raw else None
-    s_date = st.strftime("%Y-%m-%d (%a)") if st else "없음"
-    s_time = st.strftime("%H:%M") if st else "없음"
-    e_date = ed.strftime("%Y-%m-%d (%a)") if ed else "없음"
-    e_time = ed.strftime("%H:%M") if ed else "없음"
+    s_date = _fmt_kst_date(st)
+    s_time = _fmt_kst_time(st)
+    e_date = _fmt_kst_date(ed)
+    e_time = _fmt_kst_time(ed)
     desc = (e.get("description") or "").strip() or "없음"
     loc = (e.get("location") or "").strip() or "없음"
     attendees = e.get("attendees") or []
@@ -315,25 +316,92 @@ def _find_snapshot_item(sid: str, event_id: str, cal_id: str) -> Optional[Dict[s
             return e
     return None
 
+
+# ========= 시스템 정책 (요약에 선택 항목 포함하도록 강화) =========
+# schedules.py 내 SYSTEM_POLICY_TEMPLATE 만 교체
+
 SYSTEM_POLICY_TEMPLATE = """
 You are ScheduleBot. Google Calendar 연결 사용자의 일정만 처리합니다.
 - Respond in Korean.
 - 시간대는 Asia/Seoul (KST). ISO 8601 사용.
-- 기본 '전체 일정'은 공휴일과 생일을 포함하지 않는다. 사용자가 명시하면 포함.
 
-# 생성/수정 확인 단계(중요)
-- 사용자가 참석자를 언급하지 않았다면, 참석자 관련 질문을 하지 않는다.
-- 확인 메시지에는 제목/시간/설명/위치/참석자만 보여주고, '이대로 일정을 추가(또는 수정)할까요?' 같은 예/아니오만 묻는다.
-- 확인 단계에는 '(참석자는 이메일 주소로 입력해주세요)' 같은 힌트를 넣지 않는다.
-- 참석자 힌트: 생성/수정 안내문에 반드시 '참석자는 이메일 주소로 입력해주세요 (예: name@example.com)' 를 포함한다.
-- 참석자 처리(중요):
-  • '참석자(이메일 형식으로 되어있어야 한다.)가 실제로 포함/변경되는 경우에만' 메일 발송 여부를 물어본다.
-    - create_event: attendees가 비어있지 않을 때만 질문.
-    - update_event: patch.attendees가 비어있지 않을 때만 질문.
-  • attendees가 없거나 빈 배열이면 메일 발송 여부를 절대 묻지 않는다.
+[생성 흐름]
+- 사용자가 생성 의도를 보이면, 첫 응답은 반드시 아래 형식의 안내 블록으로 시작해야 합니다.
+  (문구는 자연스럽게 표현해도 되지만, **필수/선택 구분과 항목 이름은 모두 포함**)
+
+일정을 생성하기 위해 필요한 정보를 알려주세요. **필수 항목만 포함해서 자유롭게 작성해 주셔도 됩니다.**
+
+- [필수] 제목
+- [필수] 시작 시간
+- [필수] 종료 시간
+- [선택] 설명
+- [선택] 위치
+- [선택] 참석자 이메일 (쉼표로 여러 명 가능)
+
+- 위 안내 블록은 **첫 질문에서만** 보여줍니다.
+- 이후의 확인/완료/목록 응답에는 예시나 형식 안내를 넣지 않습니다.
+- 확인 단계는 “요약 → (예/아니오) 생성/수정 여부”로 진행합니다.
+  참석자가 1명 이상인 경우, 생성/수정이 ‘예’로 확정된 다음 **별도 질문**으로 “초대 메일을 보낼까요? (예/아니오)”를 한 번만 물어보세요.
+- **사용자에게 ISO 형식(예: 2025-08-21T10:00) 예시는 절대 보여주지 마세요.**
+
+[수정 흐름]
+- (생략 — 기존 그대로)
+
+[목록]
+- (생략 — 기존 그대로)
+
 현재 시각(KST): {NOW_ISO}, Today: {TODAY_FRIENDLY}.
 """
 
+
+
+# ========= 출력 후처리(ISO → 한국식 변환) =========
+ISO_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?")
+ISO_PAREN_EXAMPLE_RE = re.compile(
+    r"\s*\([^)]*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?[^)]*\)\s*"
+)
+HELPER_NOTE_PREFIX = "(날짜/시간은 자연어로 적어주세요"
+
+def _iso_str_to_kst_friendly(iso_str: str) -> str:
+    """ISO 문자열을 KST 기준 'YYYY-MM-DD (요일) HH:MM'으로 변환. 실패 시 원문 반환."""
+    try:
+        s = iso_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        dt = (dt if dt.tzinfo else dt.replace(tzinfo=KST)).astimezone(KST)
+        w = WEEKDAY_KO[dt.weekday()]
+        return f"{dt.strftime('%Y-%m-%d')} ({w}) {dt.strftime('%H:%M')}"
+    except Exception:
+        return iso_str
+
+def _sanitize_llm_reply_text(text: str, *, allow_helper: bool) -> str:
+    """
+    - 괄호 속 ISO 예시 제거
+    - 본문 내 ISO는 한국식으로 **치환**
+    - '형식으로 입력' 같은 강요 문구 제거
+    - allow_helper=False 이면 자연어 안내 헬퍼도 제거
+    """
+    if not text:
+        return text
+
+    out_lines = []
+    for raw in text.splitlines():
+        line = ISO_PAREN_EXAMPLE_RE.sub("", raw).rstrip()
+        line = ISO_TS_RE.sub(lambda m: _iso_str_to_kst_friendly(m.group(0)), line)
+
+        if ("형식으로 입력" in line) or ("정확한 형식" in line) or ("YYYY-" in line):
+            continue
+        if "일정 생성에 필요한 추가 정보를 요청드립니다" in line:
+            continue
+        if (not allow_helper) and (HELPER_NOTE_PREFIX in line):
+            continue
+
+        line = re.sub(r"\s{2,}", " ", line).rstrip()
+        out_lines.append(line)
+
+    cleaned = "\n".join(out_lines).strip()
+    return cleaned or text
+
+# ========= 입출력 모델 =========
 class ChatIn(BaseModel):
     user_message: str
     history: Optional[list] = None
@@ -376,8 +444,10 @@ def chat(input: ChatIn):
     choice = data["choices"][0]
     tool_calls = choice.get("message", {}).get("tool_calls") or []
 
+    # A) tool_calls가 없을 때 = 입력 유도/질문 단계일 가능성
     if not tool_calls:
         reply = choice["message"].get("content") or "일정 관련 요청을 말씀해 주세요."
+        reply = _sanitize_llm_reply_text(reply, allow_helper=True)  # 첫 질문에만 헬퍼 허용
         return ChatOut(reply=reply, tool_result=None)
 
     replies: List[str] = []
@@ -433,13 +503,14 @@ def chat(input: ChatIn):
                 "start": {"dateTime": args.get("start")},
                 "end": {"dateTime": args.get("end")},
             }
-            if args.get("description"): body["description"] = args["description"]
-            if args.get("location"): body["location"] = args["location"]
+            if args.get("description"):
+                body["description"] = args["description"]
+            if args.get("location"):
+                body["location"] = args["location"]
             if attendees_input is not None:
-                body["attendees"] = valid_emails  # 검증된 이메일만
+                body["attendees"] = valid_emails
 
             notify = args.get("notify_attendees", None)
-            # 참석자가 있을 때만 sendUpdates 적용
             send_updates = None
             if valid_emails and notify is not None:
                 send_updates = "all" if notify else "none"
@@ -534,7 +605,6 @@ def chat(input: ChatIn):
                 actions.append({"ok": False, "error": "not_found"})
                 continue
 
-            # 중복 제거
             seen = set()
             uniq_targets: List[Tuple[str, str]] = []
             for t in targets:
@@ -549,7 +619,6 @@ def chat(input: ChatIn):
 
             deleted_pretty_lines: List[str] = []
             for eid, cal in uniq_targets:
-                # 삭제 전 보기 좋은 텍스트
                 pretty = None
                 snap = _find_snapshot_item(sid, eid, cal)
                 if snap:
@@ -633,18 +702,19 @@ def chat(input: ChatIn):
             if not event_id:
                 replies.append("대상을 찾을 수 없어요. 먼저 '전체 일정 보여줘'로 목록을 띄워주세요.")
                 actions.append({"ok": False, "error": "not_found"})
-                continue
-
-            try:
-                e = gcal_get_event(sid, cal_id or "primary", event_id)
-                replies.append("수정할 항목을 알려주세요. (제목/시간/설명/위치/참석자)\n(참석자는 이메일 주소로 입력해주세요)\n\n" + _fmt_detail_g(e))
-                actions.append({"detail": _pack_g(e)})
-            except HTTPException:
-                replies.append("대상을 찾을 수 없어요.")
-                actions.append({"ok": False, "error": "not_found"})
+            else:
+                try:
+                    e = gcal_get_event(sid, cal_id or "primary", event_id)
+                    replies.append(
+                        "수정할 항목을 알려주세요. (제목/시간/설명/위치/참석자)\n"
+                        "(참석자는 이메일 주소로 입력해주세요)\n\n" + _fmt_detail_g(e)
+                    )
+                    actions.append({"detail": _pack_g(e)})
+                except HTTPException:
+                    replies.append("대상을 찾을 수 없어요.")
+                    actions.append({"ok": False, "error": "not_found"})
             continue
 
-    # 변경 동기화
     if did_mutation:
         items = gcal_list_events_all(sid, None, None, None)
         SESSION_LAST_LIST[sid] = [(it.get("id"), it.get("_calendarId") or "primary") for it in items]
@@ -653,5 +723,7 @@ def chat(input: ChatIn):
         replies.append("\n변경 후 최신 목록입니다:\n" + ("\n".join(lines) if lines else "남아있는 일정이 없어요."))
         actions.append({"list": [{"idx": i + 1, **_pack_g(e)} for i, e in enumerate(items)]})
 
+    # B) tool_calls가 있었던 단계 → 헬퍼(예시) 제거
     reply = "\n\n".join(replies) if replies else "완료했습니다."
+    reply = _sanitize_llm_reply_text(reply, allow_helper=False)
     return ChatOut(reply=reply, tool_result={"actions": actions})

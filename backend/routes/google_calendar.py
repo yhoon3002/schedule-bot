@@ -3,13 +3,22 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, Query, Body
 from routes.google_oauth import _refresh
-
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/google/calendar", tags=["google-calendar"])
 
 GCAL_BASE = "https://www.googleapis.com/calendar/v3"
 KST = timezone(timedelta(hours=9))
+
+# 생일 제외 시 포함할 이벤트 타입(생일만 빼고 나머지는 모두 포함)
+_EVENT_TYPES_NO_BIRTHDAY = [
+    "default",
+    "fromGmail",
+    "outOfOffice",
+    "workingLocation",
+    "focusTime",
+]
 
 def _auth_header(session_id: str) -> Dict[str, str]:
     tok = _refresh(session_id)
@@ -30,6 +39,14 @@ def _normalize_rfc3339(s: Optional[str]) -> Optional[str]:
         return s
     return s + "Z"
 
+def _cid(s: str) -> str:
+    # 캘린더 ID 경로-세그먼트 인코딩
+    return quote(s, safe='@._-+%')
+
+def _eid(s: str) -> str:
+    # 이벤트 ID 경로-세그먼트 인코딩
+    return quote(s, safe='@._-+%')
+
 # ---- 캘린더 리스트 ----
 def gcal_list_calendar_list(session_id: str) -> List[Dict[str, Any]]:
     headers = _auth_header(session_id)
@@ -46,7 +63,13 @@ def _cal_type(cal: Dict[str, Any]) -> str:
     summary = (cal.get("summaryOverride") or cal.get("summary") or "").lower()
     if "holiday" in cid or cid.endswith("holiday@group.v.calendar.google.com") or "holiday" in summary:
         return "holiday"
-    if cid.startswith("addressbook#") or "birthday" in cid or "birthdays" in summary:
+    if (
+        cid.startswith("addressbook#")
+        or cid.endswith("contacts@group.v.calendar.google.com")
+        or "birthday" in cid
+        or "birthdays" in summary
+        or "생일" in summary
+    ):
         return "birthday"
     return "normal"
 
@@ -57,33 +80,36 @@ def _list_events_for_calendar(
     time_min: Optional[str],
     time_max: Optional[str],
     query: Optional[str],
+    include_birthdays: bool,
 ) -> List[Dict[str, Any]]:
     headers = _auth_header(session_id)
-    params = {"singleEvents": "true", "orderBy": "startTime", "maxResults": 2500}
+    params: Dict[str, Any] = {"singleEvents": "true", "orderBy": "startTime", "maxResults": 2500}
     if time_min:
         params["timeMin"] = _normalize_rfc3339(time_min)
     if time_max:
         params["timeMax"] = _normalize_rfc3339(time_max)
     if query:
         params["q"] = query
+    if not include_birthdays:
+        params["eventTypes"] = _EVENT_TYPES_NO_BIRTHDAY
 
     r = requests.get(
-        f"{GCAL_BASE}/calendars/{calendar_id}/events",
+        f"{GCAL_BASE}/calendars/{_cid(calendar_id)}/events",
         headers=headers,
         params=params,
         timeout=25,
     )
     if not r.ok:
-        logger.error(
-            "List events failed(%s) cid=%s | %s", r.status_code, calendar_id, r.text
-        )
+        logger.error("List events failed(%s) cid=%s | %s", r.status_code, calendar_id, r.text)
         raise HTTPException(502, "Google Calendar list failed")
     items = r.json().get("items", [])
+    if not include_birthdays:
+        items = [it for it in items if it.get("eventType") != "birthday"]
     for it in items:
         it["_calendarId"] = calendar_id
     return items
 
-# ---- 모든 캘린더에서 모아오기 (기본: 오늘~연말 KST, 공휴일/생일 제외) ----
+# ---- 모든 캘린더에서 모아오기 ----
 def gcal_list_events_all(
     session_id: str,
     time_min: Optional[str],
@@ -101,11 +127,7 @@ def gcal_list_events_all(
 
     logger.info(
         "[GCAL] list all: timeMin=%s, timeMax=%s, q=%s, incHol=%s, incBday=%s",
-        time_min,
-        time_max,
-        query,
-        include_holidays,
-        include_birthdays,
+        time_min, time_max, query, include_holidays, include_birthdays,
     )
 
     calendars = gcal_list_calendar_list(session_id)
@@ -126,7 +148,9 @@ def gcal_list_events_all(
     for cal in filtered:
         cid = cal.get("id") or "primary"
         try:
-            items = _list_events_for_calendar(session_id, cid, time_min, time_max, query)
+            items = _list_events_for_calendar(
+                session_id, cid, time_min, time_max, query, include_birthdays
+            )
             logger.info("[GCAL] %s -> %d items", cid, len(items))
             all_items.extend(items)
         except HTTPException:
@@ -143,18 +167,12 @@ def gcal_list_events_all(
 def gcal_get_event(session_id: str, calendar_id: str, event_id: str) -> Dict[str, Any]:
     headers = _auth_header(session_id)
     r = requests.get(
-        f"{GCAL_BASE}/calendars/{calendar_id}/events/{event_id}",
+        f"{GCAL_BASE}/calendars/{_cid(calendar_id)}/events/{_eid(event_id)}",
         headers=headers,
         timeout=20,
     )
     if not r.ok:
-        logger.error(
-            "Get event failed(%s) cid=%s eid=%s | %s",
-            r.status_code,
-            calendar_id,
-            event_id,
-            r.text,
-        )
+        logger.error("Get event failed(%s) cid=%s eid=%s | %s", r.status_code, calendar_id, event_id, r.text)
         raise HTTPException(502, "Google Calendar get event failed")
     item = r.json()
     item["_calendarId"] = calendar_id
@@ -164,10 +182,9 @@ def gcal_insert_event(
     session_id: str,
     body: Dict[str, Any],
     calendar_id: str = "primary",
-    send_updates: Optional[str] = None,  # "all" | "none" | None
+    send_updates: Optional[str] = None,
 ) -> Dict[str, Any]:
     headers = _auth_header(session_id)
-
     b = dict(body)
     summary = b.get("summary") or b.get("title") or "(제목 없음)"
     start = b.get("start")
@@ -178,16 +195,8 @@ def gcal_insert_event(
         end = {"dateTime": end}
     payload = {
         "summary": summary,
-        "start": {
-            "dateTime": _normalize_rfc3339(
-                (start or {}).get("dateTime") or (start or {}).get("date")
-            )
-        },
-        "end": {
-            "dateTime": _normalize_rfc3339(
-                (end or {}).get("dateTime") or (end or {}).get("date")
-            )
-        },
+        "start": {"dateTime": _normalize_rfc3339((start or {}).get("dateTime") or (start or {}).get("date"))},
+        "end":   {"dateTime": _normalize_rfc3339((end   or {}).get("dateTime")   or (end   or {}).get("date"))},
     }
     if b.get("description"):
         payload["description"] = b["description"]
@@ -203,7 +212,7 @@ def gcal_insert_event(
         params["sendUpdates"] = send_updates
 
     r = requests.post(
-        f"{GCAL_BASE}/calendars/{calendar_id}/events",
+        f"{GCAL_BASE}/calendars/{_cid(calendar_id)}/events",
         headers=headers,
         params=params,
         json=payload,
@@ -221,8 +230,14 @@ def gcal_patch_event(
     event_id: str,
     body: Dict[str, Any],
     calendar_id: str = "primary",
-    send_updates: Optional[str] = None,  # "all" | "none" | None
+    send_updates: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    이벤트 부분 수정.
+    - 기본적으로 넘어온 calendar_id에서 패치.
+    - 만약 404(Not Found)면, 내 캘린더 전체를 훑어서 해당 event_id가 존재하는 실제 캘린더를 찾은 뒤
+      거기에 다시 패치(일부 상황에서 스냅샷 불일치로 캘린더가 틀릴 수 있음).
+    """
     headers = _auth_header(session_id)
     b = dict(body)
     payload: Dict[str, Any] = {}
@@ -233,23 +248,18 @@ def gcal_patch_event(
         start = b["start"]
         if isinstance(start, str):
             start = {"dateTime": start}
-        payload["start"] = {
-            "dateTime": _normalize_rfc3339(start.get("dateTime") or start.get("date"))
-        }
+        payload["start"] = {"dateTime": _normalize_rfc3339(start.get("dateTime") or start.get("date"))}
     if "end" in b and b["end"]:
         end = b["end"]
         if isinstance(end, str):
             end = {"dateTime": end}
-        payload["end"] = {
-            "dateTime": _normalize_rfc3339(end.get("dateTime") or end.get("date"))
-        }
+        payload["end"] = {"dateTime": _normalize_rfc3339(end.get("dateTime") or end.get("date"))}
     if "description" in b:
         payload["description"] = b["description"]
     if "location" in b:
         payload["location"] = b["location"]
     if "attendees" in b:
         att = _norm_attendees_for_write(b.get("attendees"))
-        # None -> 변경안함, [] -> 전부 제거, [{email..}] -> 설정
         if att is not None:
             payload["attendees"] = att
 
@@ -257,26 +267,47 @@ def gcal_patch_event(
     if send_updates:
         params["sendUpdates"] = send_updates
 
-    r = requests.patch(
-        f"{GCAL_BASE}/calendars/{calendar_id}/events/{event_id}",
-        headers=headers,
-        params=params,
-        json=payload,
-        timeout=20,
-    )
-    if not r.ok:
-        logger.error("Patch event failed: %s | %s", r.status_code, r.text)
-        raise HTTPException(502, "Google Calendar update failed")
-    item = r.json()
-    item["_calendarId"] = calendar_id
-    return item
+    # 1차 시도
+    url = f"{GCAL_BASE}/calendars/{_cid(calendar_id)}/events/{_eid(event_id)}"
+    r = requests.patch(url, headers=headers, params=params, json=payload, timeout=20)
+    if r.ok:
+        item = r.json()
+        item["_calendarId"] = calendar_id
+        return item
+
+    # 404일 때만 재시도 (다른 캘린더에 있을 가능성)
+    if r.status_code == 404:
+        logger.warning("Patch 404 on %s @ %s. Retrying by probing calendars...", event_id, calendar_id)
+        try:
+            # 내 캘린더 전체에서 event_id 위치 탐색
+            for cal in gcal_list_calendar_list(session_id):
+                cid = cal.get("id") or "primary"
+                probe = requests.get(
+                    f"{GCAL_BASE}/calendars/{_cid(cid)}/events/{_eid(event_id)}",
+                    headers=headers, timeout=12
+                )
+                if probe.ok:
+                    # 찾았다면 해당 캘린더에 패치 재시도
+                    url2 = f"{GCAL_BASE}/calendars/{_cid(cid)}/events/{_eid(event_id)}"
+                    r2 = requests.patch(url2, headers=headers, params=params, json=payload, timeout=20)
+                    if r2.ok:
+                        item = r2.json()
+                        item["_calendarId"] = cid
+                        logger.info("Patch succeeded after probing. event=%s calendar=%s", event_id, cid)
+                        return item
+        except Exception as e:
+            logger.exception("Patch probe failed: %s", e)
+
+    # 그 외 에러는 원본 응답을 로깅하고 반환
+    logger.error("Patch event failed: %s | %s", r.status_code, r.text)
+    raise HTTPException(502, "Google Calendar update failed")
 
 def gcal_delete_event(
     session_id: str, event_id: str, calendar_id: str = "primary"
 ) -> None:
     headers = _auth_header(session_id)
     r = requests.delete(
-        f"{GCAL_BASE}/calendars/{calendar_id}/events/{event_id}",
+        f"{GCAL_BASE}/calendars/{_cid(calendar_id)}/events/{_eid(event_id)}",
         headers=headers,
         timeout=20,
     )
@@ -313,16 +344,6 @@ def create_event(
     calendar_id: str = Query("primary"),
     send_updates: Optional[str] = Query(None, regex="^(all|none)?$"),
 ):
-    """
-    body 예시:
-    {
-      "summary": "회의",
-      "start": {"dateTime":"2025-08-19T13:00:00+09:00"},
-      "end":   {"dateTime":"2025-08-19T14:00:00+09:00"},
-      "description": "...", "location": "...",
-      "attendees": ["a@b.com","c@d.com"]  # 문자열 or {"email":...} 형식
-    }
-    """
     item = gcal_insert_event(session_id, body, calendar_id, send_updates)
     return item
 
@@ -334,14 +355,9 @@ def patch_event(
     calendar_id: str = Query("primary"),
     send_updates: Optional[str] = Query(None, regex="^(all|none)?$"),
 ):
-    """
-    body: 부분 업데이트(같은 필드 키 그대로)
-    예) {"summary":"제목변경"} 또는 {"attendees":["a@b.com"]}
-    """
     item = gcal_patch_event(session_id, event_id, body, calendar_id, send_updates)
     return item
 
-# 프런트 일부가 PUT을 쓰는 경우를 대비해 동일 동작 제공(선택)
 @router.put("/events/{event_id}")
 def put_event(
     event_id: str,
@@ -362,17 +378,7 @@ def delete_event(
     gcal_delete_event(session_id, event_id, calendar_id)
     return {"ok": True}
 
-
-# ---- helpers ----
 def _norm_attendees_for_write(v):
-    """
-    attendees 입력을 일관된 형태로 정규화한다.
-    - "a@b.com" -> [{"email": "a@b.com"}]
-    - {"email": "a@b.com", "displayName": "..."} -> 그대로 반영
-    - 리스트면 각 원소에 대해 위 규칙 적용
-    - None => None (패치 시 '변경하지 않음')
-    - []   => []   (패치 시 '모두 제거')
-    """
     if v is None:
         return None
     if not isinstance(v, list):
