@@ -568,13 +568,12 @@ export default defineComponent({
                     summary: (modal.title || "일정").trim(),
                     start: start.toISOString(),
                     end: end.toISOString(),
+                    attendees: [...modal.attendees],
                 };
                 if (modal.location?.trim())
                     payload.location = modal.location.trim();
                 if (modal.description?.trim())
                     payload.description = modal.description.trim();
-                if (modal.attendees.length)
-                    payload.attendees = [...modal.attendees];
 
                 // send_updates 파라미터: 참석자 있을 때만 전달
                 const send_updates =

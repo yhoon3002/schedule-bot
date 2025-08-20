@@ -1,6 +1,8 @@
 <!-- src/components/AuthGateComponent.vue -->
 <template>
-    <div class="min-h-screen flex items-center justify-center bg-[#f8f8ff]">
+    <div
+        class="w-screen min-h-screen flex items-center justify-center bg-[#f8f8ff]"
+    >
         <div class="w-full max-w-md rounded-lg bg-white shadow p-6">
             <h1 class="text-xl font-semibold mb-2">AI ScheduleBot</h1>
             <p class="text-gray-600 mb-6">
