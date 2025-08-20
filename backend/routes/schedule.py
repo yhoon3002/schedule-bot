@@ -50,7 +50,6 @@ def _split_valid_invalid_attendees(v):
         else:
             invalid.append(str(x))
     return valid, invalid
-# ----------------------------------
 
 def _now_kst_iso() -> str:
     return datetime.now(KST).isoformat()
@@ -87,7 +86,7 @@ TOOLS_SPEC = [
                 "properties": {
                     "title": {"type": "string"},
                     "start": {"type": "string", "format": "date-time"},
-                    "end": {"type": "string", "format": "date-time"},
+                    "end": {"type": "string", "format": "date-time"},  # 선택(없으면 시작+1h)
                     "description": {"type": "string"},
                     "location": {"type": "string"},
                     "attendees": {"type": "array", "items": {"type": "string"}},
@@ -97,7 +96,8 @@ TOOLS_SPEC = [
                     },
                     "session_id": {"type": "string"},
                 },
-                "required": ["title", "start", "end"],
+                # ✅ 종료시간은 필수가 아님
+                "required": ["title", "start"],
                 "additionalProperties": False,
             },
         },
@@ -316,10 +316,26 @@ def _find_snapshot_item(sid: str, event_id: str, cal_id: str) -> Optional[Dict[s
             return e
     return None
 
+# ====== 시간 파싱 유틸 ======
+def _parse_dt(dt_str: Optional[str]) -> Optional[datetime]:
+    if not dt_str:
+        return None
+    s = dt_str.strip()
+    try:
+        if len(s) == 10:
+            dt = datetime.fromisoformat(s + "T00:00:00+09:00")
+        else:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=KST)
+        return dt.astimezone(KST)
+    except Exception:
+        return None
 
-# ========= 시스템 정책 (요약에 선택 항목 포함하도록 강화) =========
-# schedules.py 내 SYSTEM_POLICY_TEMPLATE 만 교체
+def _rfc3339(dt: datetime) -> str:
+    return dt.astimezone(KST).isoformat()
 
+# ========= 시스템 정책 (최초 안내에 '종료 미입력 시 +1시간' 명시) =========
 SYSTEM_POLICY_TEMPLATE = """
 You are ScheduleBot. Google Calendar 연결 사용자의 일정만 처리합니다.
 - Respond in Korean.
@@ -330,30 +346,30 @@ You are ScheduleBot. Google Calendar 연결 사용자의 일정만 처리합니�
   (문구는 자연스럽게 표현해도 되지만, **필수/선택 구분과 항목 이름은 모두 포함**)
 
 일정을 생성하기 위해 필요한 정보를 알려주세요. **필수 항목을 포함해서 자유롭게 작성해 주셔도 됩니다.**
+※ 종료 시간을 비우면 시작 시간 기준 **1시간 뒤**로 자동 설정합니다.
 
 - [필수] 제목
 - [필수] 시작 시간
-- [필수] 종료 시간
+- [선택] 종료 시간 (미입력 시 시작+1시간)
 - [선택] 설명
 - [선택] 위치
 - [선택] 참석자 이메일 (쉼표로 여러 명 가능)
 
 - 위 안내 블록은 **첫 질문에서만** 보여줍니다.
-- 이후의 확인/완료/목록 응답에는 예시나 형식 안내를 넣지 않습니다.
-- 확인 단계는 “요약 → (예/아니오) 생성/수정 여부”로 진행합니다.
-  참석자가 1명 이상인 경우, 생성/수정이 ‘예’로 확정된 다음 **별도 질문**으로 “초대 메일을 보낼까요? (예/아니오)”를 한 번만 물어보세요.
+- 선택 항목(설명/위치/참석자/종료)이 비었더라도 재질문으로 강요하지 말고, 가능한 값으로 가정하여 **확인 단계**로 진행하세요.
+- 참석자가 1명 이상인 경우, 생성/수정이 ‘예’로 확정된 다음 **별도 질문**으로 “초대 메일을 보낼까요? (예/아니오)”를 한 번만 물어보세요.
 - **사용자에게 ISO 형식(예: 2025-08-21T10:00) 예시는 절대 보여주지 마세요.**
 
 [수정 흐름]
-- (생략 — 기존 그대로)
+- 수정도 동일한 '요약 → (예/아니오) 확인' 플로우를 사용합니다.
+- 참석자 변경이 있을 때만, 수정 확정 후 별도의 한 질문으로 초대 메일 여부를 묻습니다.
+  (기존 참석자에게는 다시 보내지 않고, **새로 추가된 이메일에만** 보내야 함을 명확히 알립니다.)
 
 [목록]
-- (생략 — 기존 그대로)
+- 기본 ‘전체 일정’은 공휴일/생일을 포함하지 않습니다. 사용자가 명시하면 포함합니다.
 
 현재 시각(KST): {NOW_ISO}, Today: {TODAY_FRIENDLY}.
 """
-
-
 
 # ========= 출력 후처리(ISO → 한국식 변환) =========
 ISO_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?")
@@ -363,7 +379,6 @@ ISO_PAREN_EXAMPLE_RE = re.compile(
 HELPER_NOTE_PREFIX = "(날짜/시간은 자연어로 적어주세요"
 
 def _iso_str_to_kst_friendly(iso_str: str) -> str:
-    """ISO 문자열을 KST 기준 'YYYY-MM-DD (요일) HH:MM'으로 변환. 실패 시 원문 반환."""
     try:
         s = iso_str.replace("Z", "+00:00")
         dt = datetime.fromisoformat(s)
@@ -374,32 +389,37 @@ def _iso_str_to_kst_friendly(iso_str: str) -> str:
         return iso_str
 
 def _sanitize_llm_reply_text(text: str, *, allow_helper: bool) -> str:
-    """
-    - 괄호 속 ISO 예시 제거
-    - 본문 내 ISO는 한국식으로 **치환**
-    - '형식으로 입력' 같은 강요 문구 제거
-    - allow_helper=False 이면 자연어 안내 헬퍼도 제거
-    """
     if not text:
         return text
-
     out_lines = []
     for raw in text.splitlines():
         line = ISO_PAREN_EXAMPLE_RE.sub("", raw).rstrip()
         line = ISO_TS_RE.sub(lambda m: _iso_str_to_kst_friendly(m.group(0)), line)
-
         if ("형식으로 입력" in line) or ("정확한 형식" in line) or ("YYYY-" in line):
             continue
         if "일정 생성에 필요한 추가 정보를 요청드립니다" in line:
             continue
         if (not allow_helper) and (HELPER_NOTE_PREFIX in line):
             continue
-
         line = re.sub(r"\s{2,}", " ", line).rstrip()
         out_lines.append(line)
-
     cleaned = "\n".join(out_lines).strip()
     return cleaned or text
+
+# ========= 목록 블록 렌더러 (번호/줄바꿈 일관화) =========
+ZERO = "\u200B"  # zero-width space (문단 분리 없이 한 줄 공백 효과)
+
+def _render_list_block(items: List[dict]) -> str:
+    out: List[str] = []
+    for i, e in enumerate(items, start=1):
+        two = _line_required_g(e)  # "제목\n시간범위"
+        title, time_range = (two.split("\n", 1) + [""])[:2]
+        out.append(f"{i}\\) {title}")   # ol로 렌더링되는 것 방지
+        if time_range:
+            out.append(time_range)
+        if i != len(items):
+            out.append(ZERO)           # 항목 사이에만 빈 줄
+    return "\n".join(out)
 
 # ========= 입출력 모델 =========
 class ChatIn(BaseModel):
@@ -444,10 +464,10 @@ def chat(input: ChatIn):
     choice = data["choices"][0]
     tool_calls = choice.get("message", {}).get("tool_calls") or []
 
-    # A) tool_calls가 없을 때 = 입력 유도/질문 단계일 가능성
+    # A) tool_calls가 없을 때 = 입력 유도/질문 단계
     if not tool_calls:
         reply = choice["message"].get("content") or "일정 관련 요청을 말씀해 주세요."
-        reply = _sanitize_llm_reply_text(reply, allow_helper=True)  # 첫 질문에만 헬퍼 허용
+        reply = _sanitize_llm_reply_text(reply, allow_helper=True)  # 첫 질문만 헬퍼 허용
         return ChatOut(reply=reply, tool_result=None)
 
     replies: List[str] = []
@@ -480,8 +500,11 @@ def chat(input: ChatIn):
                 replies.append("다음 일정을 찾았어요:\n" + _fmt_detail_g(e))
                 actions.append({"list": [_pack_g(e)]})
             else:
-                lines = [f"{i+1}) {_line_required_g(e)}" for i, e in enumerate(items)]
-                replies.append("여러 개가 있어요. 번호를 선택하시면 상세 정보를 알려드릴게요:\n" + "\n".join(lines))
+                block = _render_list_block(items)
+                replies.append(
+                    "여러 개가 있어요. 번호를 선택하시면 상세 정보를 알려드릴게요:\n"
+                    + ZERO + "\n" + block
+                )
                 actions.append({"list": [{"idx": i + 1, **_pack_g(e)} for i, e in enumerate(items)]})
             continue
 
@@ -498,10 +521,20 @@ def chat(input: ChatIn):
                 actions.append({"ok": False, "error": "invalid_attendees", "invalid": invalids})
                 continue
 
+            # ✅ 종료시간 미입력 시 시작+1시간으로 자동 보정
+            start_dt = _parse_dt(args.get("start"))
+            if not start_dt:
+                replies.append("시작 시간을 이해하지 못했어요. 예: '8월 25일 13:00'처럼 알려주세요.")
+                actions.append({"ok": False, "error": "bad_start"})
+                continue
+            end_dt = _parse_dt(args.get("end"))
+            if (end_dt is None) or (end_dt <= start_dt):
+                end_dt = start_dt + timedelta(hours=1)
+
             body = {
                 "summary": args.get("title") or "(제목 없음)",
-                "start": {"dateTime": args.get("start")},
-                "end": {"dateTime": args.get("end")},
+                "start": {"dateTime": _rfc3339(start_dt)},
+                "end": {"dateTime": _rfc3339(end_dt)},
             }
             if args.get("description"):
                 body["description"] = args["description"]
@@ -547,10 +580,24 @@ def chat(input: ChatIn):
             p = args.get("patch") or {}
             body: Dict[str, Any] = {}
             if "title" in p: body["summary"] = p["title"]
-            if "start" in p: body.setdefault("start", {})["dateTime"] = p["start"]
-            if "end" in p: body.setdefault("end", {})["dateTime"] = p["end"]
+
+            new_start_dt = _parse_dt(p.get("start"))
+            new_end_dt   = _parse_dt(p.get("end"))
+
+            if new_start_dt:
+                body.setdefault("start", {})["dateTime"] = _rfc3339(new_start_dt)
+            if new_end_dt:
+                body.setdefault("end", {})["dateTime"] = _rfc3339(new_end_dt)
+
+            # ✅ start만 바뀌고 end가 없거나 start>=end면 start+1h로 보정
+            if new_start_dt and (not new_end_dt):
+                cur = gcal_get_event(sid, cal_id or "primary", event_id)
+                cur_end_dt = _parse_dt(cur.get("end", {}).get("dateTime") or cur.get("end", {}).get("date"))
+                if (cur_end_dt is None) or (cur_end_dt <= new_start_dt):
+                    body.setdefault("end", {})["dateTime"] = _rfc3339(new_start_dt + timedelta(hours=1))
+
             if "description" in p: body["description"] = p["description"]
-            if "location" in p: body["location"] = p["location"]
+            if "location"    in p: body["location"]    = p["location"]
 
             send_updates = None
             if "attendees" in p:
@@ -645,7 +692,7 @@ def chat(input: ChatIn):
                     deleted_pretty_lines.append(pretty or f"- id={eid} (calendar={cal})")
                 except HTTPException as ex:
                     replies.append(f"일정 삭제 중 오류가 발생했어요: {ex.detail}")
-                    actions.append({"ok": False, "error": ex.detail})
+                    actions.append({"ok": False, "error": "not_found"})
 
             if deleted_pretty_lines:
                 replies.append("🗑️ 다음 일정을 삭제했어요:\n" + "\n".join(f"- {line}" for line in deleted_pretty_lines))
@@ -725,11 +772,11 @@ def chat(input: ChatIn):
         items = gcal_list_events_all(sid, None, None, None)
         SESSION_LAST_LIST[sid] = [(it.get("id"), it.get("_calendarId") or "primary") for it in items]
         SESSION_LAST_ITEMS[sid] = items
-        lines = [f"{i+1}) {_line_required_g(e)}" for i, e in enumerate(items)]
-        replies.append("\n변경 후 최신 목록입니다:\n" + ("\n".join(lines) if lines else "남아있는 일정이 없어요."))
+        block = _render_list_block(items)
+        replies.append("\n변경 후 최신 목록입니다:\n" + ZERO + "\n" + (block if block else "남아있는 일정이 없어요."))
         actions.append({"list": [{"idx": i + 1, **_pack_g(e)} for i, e in enumerate(items)]})
 
-    # B) tool_calls가 있었던 단계 → 헬퍼(예시) 제거
+    # B) tool_calls가 있었던 단계 → 헬퍼 제거
     reply = "\n\n".join(replies) if replies else "완료했습니다."
     reply = _sanitize_llm_reply_text(reply, allow_helper=False)
     return ChatOut(reply=reply, tool_result={"actions": actions})
