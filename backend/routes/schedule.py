@@ -530,8 +530,14 @@ def chat(input: ChatIn):
                 if pair:
                     event_id, cal_id = pair
             if not event_id and args.get("id"):
-                event_id = str(args["id"]).strip()
-                cal_id = _find_cal_for_id(sid, event_id) or "primary"
+                raw_id = str(args["id"]).strip()
+                if raw_id.isdigit() and len(raw_id) < 6:
+                    pair = _map_index_to_pair(sid, int(raw_id))
+                    if pair:
+                        event_id, cal_id = pair
+                else:
+                    event_id = raw_id
+                    cal_id = _find_cal_for_id(sid, event_id) or "primary"
 
             if not event_id:
                 replies.append("수정할 대상을 찾지 못했어요. 먼저 '전체 일정'으로 목록을 띄워주세요.")
