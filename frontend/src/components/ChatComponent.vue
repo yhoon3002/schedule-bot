@@ -58,13 +58,11 @@
 <script lang="ts">
 import { defineComponent, nextTick } from "vue";
 import { chatSchedule } from "../api/chat_schedule";
-
-// markdown-it + DOMPurify
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 
 const md = new MarkdownIt({
-    breaks: true, // 줄바꿈 → <br>
+    breaks: true,
     linkify: true,
     html: false,
 });

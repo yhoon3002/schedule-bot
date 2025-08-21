@@ -1,7 +1,5 @@
-<!-- src/components/MainComponent.vue -->
 <template>
     <div>
-        <!-- 좌측 사이드바 -->
         <div
             :class="[
                 'transition-all duration-300 transform fixed top-0 start-0 bottom-0 z-60 bg-white border-e border-gray-200 overflow-x-hidden h-full',
@@ -27,6 +25,7 @@
                         type="button"
                         @click="toggleSidebar"
                         class="flex justify-center items-center size-8 p-[0] text-gray-600 hover:bg-gray-100 rounded-full"
+                        aria-label="Toggle sidebar"
                     >
                         <svg
                             xmlns="http://www.w3.org/2000/svg"
@@ -51,8 +50,12 @@
                         <li>
                             <a
                                 role="button"
-                                class="flex items-center gap-x-3.5 py-2 px-2.5 text-sm text-gray-800 rounded-lg hover:bg-gray-100 cursor-pointer"
                                 @click="viewState = 0"
+                                :aria-current="
+                                    viewState === 0 ? 'page' : undefined
+                                "
+                                :class="navClasses(0)"
+                                :title="isMinified ? 'Chat' : undefined"
                             >
                                 <svg
                                     class="size-4"
@@ -72,8 +75,12 @@
                         <li>
                             <a
                                 role="button"
-                                class="flex items-center gap-x-3.5 py-2 px-2.5 text-sm text-gray-800 rounded-lg hover:bg-gray-100 cursor-pointer"
                                 @click="viewState = 1"
+                                :aria-current="
+                                    viewState === 1 ? 'page' : undefined
+                                "
+                                :class="navClasses(1)"
+                                :title="isMinified ? 'Calendar' : undefined"
                             >
                                 <svg
                                     class="size-4"
@@ -103,9 +110,7 @@
                     </ul>
                 </nav>
 
-                <!-- 프로필: 팝업 제거, 항상 표시 -->
                 <footer class="p-2 border-t border-gray-200">
-                    <!-- 접힘 상태: 아바타만 -->
                     <div
                         v-if="isMinified"
                         class="w-full h-full flex justify-center items-center py-3"
@@ -120,7 +125,6 @@
                         />
                     </div>
 
-                    <!-- 펼침 상태: 팝업 스타일의 카드 상시 표시 -->
                     <div
                         v-else
                         class="rounded border bg-white shadow p-3 text-sm"
@@ -161,7 +165,6 @@
             </div>
         </div>
 
-        <!-- 우측 본문 -->
         <div
             class="w-screen h-screen transition-all duration-300 overflow-y-auto"
             :class="isMinified ? 'pl-14' : 'pl-64'"
@@ -187,17 +190,29 @@ export default {
     data() {
         return { isMinified: false, viewState: 0 };
     },
+
     computed: {
         user() {
             return useUserStore();
         },
     },
+
     methods: {
         toggleSidebar() {
             this.isMinified = !this.isMinified;
         },
+
         onLogout() {
             this.user.logout();
+        },
+
+        navClasses(i: number) {
+            return [
+                "flex items-center gap-x-3.5 py-2 px-2.5 text-sm rounded-lg cursor-pointer",
+                this.viewState === i
+                    ? "bg-gray-100 text-gray-900"
+                    : "text-gray-800 hover:bg-gray-100",
+            ];
         },
     },
 };

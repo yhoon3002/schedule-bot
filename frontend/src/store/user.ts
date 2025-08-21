@@ -57,7 +57,6 @@ export const useUserStore = defineStore("user", {
                     this.profile = { name: "" };
                 }
 
-                // 서버가 내려주면 반영(없으면 항상 false)
                 this.hasRefresh = !!data?.has_refresh;
             } finally {
                 this.initialized = true;
@@ -79,7 +78,6 @@ export const useUserStore = defineStore("user", {
                         ux_mode: "popup",
                         redirect_uri: REDIRECT_URI,
                         include_granted_scopes: true,
-                        // 🔑 refresh_token을 안정적으로 받기 위함
                         prompt: "consent",
                         access_type: "offline",
                         login_hint:
@@ -87,19 +85,16 @@ export const useUserStore = defineStore("user", {
                         callback: (resp: any) => resolve(resp?.code ?? null),
                     } as any
                 );
-                // ⚠️ 클릭 핸들러 동기 흐름에서 바로 호출되어야 팝업 차단 안 됨
                 codeClient.requestCode();
             });
         },
 
-        // ✅ 옵션 A: 로그인 + 캘린더 연동을 한 번에 (팝업 1회)
         async loginAndConnect(): Promise<boolean> {
             this.busy = true;
             try {
                 const code = await this.requestGoogleCode(SCOPE_ALL);
                 if (!code) return false;
 
-                // login 대신 connect 한 번만 호출하면, 서버가 토큰/프로필/스코프까지 세팅
                 await axios.post("/auth/google/connect", {
                     code,
                     redirect_uri: REDIRECT_URI,
@@ -116,10 +111,10 @@ export const useUserStore = defineStore("user", {
             }
         },
 
-        // 호환용: 기존 호출이 남아있어도 1회 플로우로 동작하도록 래핑
         async googleSignIn(): Promise<boolean> {
             return this.loginAndConnect();
         },
+
         async connectGoogle(): Promise<boolean> {
             return this.loginAndConnect();
         },

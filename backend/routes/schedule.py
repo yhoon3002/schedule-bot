@@ -1,4 +1,3 @@
-# schedules.py
 import os, re, json, logging, requests
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
@@ -25,14 +24,14 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 KST = timezone(timedelta(hours=9))
 CAL_SCOPE = "https://www.googleapis.com/auth/calendar"
 
-# ---------- 한국어 요일 ----------
+# 영어 요일을 한글로 바꿀때 사용
 WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
 
-# -------- Email validation --------
+# 이메일 검증
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
+# 입력을 [valid_emails], [invalid_values]로 분리.
 def _split_valid_invalid_attendees(v):
-    """입력을 [valid_emails], [invalid_values]로 분리."""
     if v is None:
         return [], []
     if not isinstance(v, list):
@@ -86,7 +85,7 @@ TOOLS_SPEC = [
                 "properties": {
                     "title": {"type": "string"},
                     "start": {"type": "string", "format": "date-time"},
-                    "end": {"type": "string", "format": "date-time"},  # 선택(없으면 시작+1h)
+                    "end": {"type": "string", "format": "date-time"},
                     "description": {"type": "string"},
                     "location": {"type": "string"},
                     "attendees": {"type": "array", "items": {"type": "string"}},
@@ -96,7 +95,6 @@ TOOLS_SPEC = [
                     },
                     "session_id": {"type": "string"},
                 },
-                # ✅ 종료시간은 필수가 아님
                 "required": ["title", "start"],
                 "additionalProperties": False,
             },
@@ -316,7 +314,7 @@ def _find_snapshot_item(sid: str, event_id: str, cal_id: str) -> Optional[Dict[s
             return e
     return None
 
-# ====== 시간 파싱 유틸 ======
+# 시간 파싱 유틸
 def _parse_dt(dt_str: Optional[str]) -> Optional[datetime]:
     if not dt_str:
         return None
@@ -335,7 +333,7 @@ def _parse_dt(dt_str: Optional[str]) -> Optional[datetime]:
 def _rfc3339(dt: datetime) -> str:
     return dt.astimezone(KST).isoformat()
 
-# ========= 시스템 정책 (최초 안내에 '종료 미입력 시 +1시간' 명시) =========
+# 시스템 정책
 SYSTEM_POLICY_TEMPLATE = """
 You are ScheduleBot. Google Calendar 연결 사용자의 일정만 처리합니다.
 - Respond in Korean.
@@ -371,7 +369,7 @@ You are ScheduleBot. Google Calendar 연결 사용자의 일정만 처리합니�
 현재 시각(KST): {NOW_ISO}, Today: {TODAY_FRIENDLY}.
 """
 
-# ========= 출력 후처리(ISO → 한국식 변환) =========
+# 출력 후처리(ISO -> 한국식 변환)
 ISO_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?")
 ISO_PAREN_EXAMPLE_RE = re.compile(
     r"\s*\([^)]*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?[^)]*\)\s*"
@@ -406,22 +404,23 @@ def _sanitize_llm_reply_text(text: str, *, allow_helper: bool) -> str:
     cleaned = "\n".join(out_lines).strip()
     return cleaned or text
 
-# ========= 목록 블록 렌더러 (번호/줄바꿈 일관화) =========
-ZERO = "\u200B"  # zero-width space (문단 분리 없이 한 줄 공백 효과)
+# 목록 블록(번호/줄바꿈 일관화)
+ZERO = "\u200B"  # 한 줄 공백 효과
 
-def _render_list_block(items: List[dict]) -> str:
+def _render_list_block(items: List[dict], *, indices: Optional[List[int]] = None) -> str:
     out: List[str] = []
-    for i, e in enumerate(items, start=1):
-        two = _line_required_g(e)  # "제목\n시간범위"
+    for idx, e in enumerate(items, start=1):
+        no = (indices[idx - 1] if indices and len(indices) >= idx else idx)
+        two = _line_required_g(e)
         title, time_range = (two.split("\n", 1) + [""])[:2]
-        out.append(f"{i}\\) {title}")   # ol로 렌더링되는 것 방지
+        out.append(f"{no}\\) {title}")
         if time_range:
             out.append(time_range)
-        if i != len(items):
-            out.append(ZERO)           # 항목 사이에만 빈 줄
+        if idx != len(items):
+            out.append(ZERO)
     return "\n".join(out)
 
-# ========= 입출력 모델 =========
+# 입출력 모델
 class ChatIn(BaseModel):
     user_message: str
     history: Optional[list] = None
@@ -464,10 +463,10 @@ def chat(input: ChatIn):
     choice = data["choices"][0]
     tool_calls = choice.get("message", {}).get("tool_calls") or []
 
-    # A) tool_calls가 없을 때 = 입력 유도/질문 단계
     if not tool_calls:
         reply = choice["message"].get("content") or "일정 관련 요청을 말씀해 주세요."
-        reply = _sanitize_llm_reply_text(reply, allow_helper=True)  # 첫 질문만 헬퍼 허용
+        # 첫 질문에만 헬퍼 사용
+        reply = _sanitize_llm_reply_text(reply, allow_helper=True)
         return ChatOut(reply=reply, tool_result=None)
 
     replies: List[str] = []
@@ -479,7 +478,7 @@ def chat(input: ChatIn):
         raw_args = tc["function"].get("arguments") or "{}"
         args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
 
-        # ===== 목록 =====
+        # 목록
         if name == "list_events":
             items = gcal_list_events_all(
                 sid,
@@ -508,7 +507,7 @@ def chat(input: ChatIn):
                 actions.append({"list": [{"idx": i + 1, **_pack_g(e)} for i, e in enumerate(items)]})
             continue
 
-        # ===== 생성 =====
+        # 생성
         if name == "create_event":
             attendees_input = args.get("attendees")
             valid_emails, invalids = _split_valid_invalid_attendees(attendees_input)
@@ -521,7 +520,6 @@ def chat(input: ChatIn):
                 actions.append({"ok": False, "error": "invalid_attendees", "invalid": invalids})
                 continue
 
-            # ✅ 종료시간 미입력 시 시작+1시간으로 자동 보정
             start_dt = _parse_dt(args.get("start"))
             if not start_dt:
                 replies.append("시작 시간을 이해하지 못했어요. 예: '8월 25일 13:00'처럼 알려주세요.")
@@ -554,7 +552,7 @@ def chat(input: ChatIn):
             did_mutation = True
             continue
 
-        # ===== 수정 =====
+        # 수정
         if name == "update_event":
             event_id = None
             cal_id = None
@@ -620,7 +618,7 @@ def chat(input: ChatIn):
                     sid, event_id, body, cal_id or "primary",
                     send_updates=send_updates
                 )
-                replies.append("🔧 일정 수정 완료:\n(참석자는 이메일 주소로 입력해주세요)\n" + _fmt_detail_g(e))
+                replies.append("🔧 일정 수정 완료:\n" + _fmt_detail_g(e))
                 actions.append({"updated": _pack_g(e)})
                 did_mutation = True
             except HTTPException as ex:
@@ -628,7 +626,7 @@ def chat(input: ChatIn):
                 actions.append({"ok": False, "error": ex.detail})
             continue
 
-        # ===== 삭제 =====
+        # 삭제
         if name == "delete_event":
             pairs_snapshot: List[Tuple[str, str]] = list(SESSION_LAST_LIST.get(sid) or [])
 
@@ -670,35 +668,40 @@ def chat(input: ChatIn):
                 actions.append({"ok": False, "error": "not_found"})
                 continue
 
-            deleted_pretty_lines: List[str] = []
+            deleted_events_for_block: List[dict] = []
+            deleted_indices_for_block: List[int] = []
+            deleted_fallback_lines: List[str] = []
+
             for eid, cal in uniq_targets:
-                pretty = None
                 snap = _find_snapshot_item(sid, eid, cal)
-                if snap:
-                    pretty = _line_required_g(snap).replace("\n", " | ")
-                    try:
-                        idx_display = pairs_snapshot.index((eid, cal)) + 1
-                        pretty = f"{idx_display}) {pretty}"
-                    except ValueError:
-                        pass
+                fallback = f"- id={eid} (calendar={cal})"
 
                 try:
                     gcal_delete_event(sid, eid, cal or "primary")
                     if snap:
                         actions.append({"deleted": _pack_g(snap)})
+                        try:
+                            idx_display = pairs_snapshot.index((eid, cal)) + 1
+                        except ValueError:
+                            idx_display = None
+                        deleted_events_for_block.append(snap)
+                        deleted_indices_for_block.append(idx_display or len(deleted_events_for_block))
                     else:
                         actions.append({"deleted": {"id": eid, "calendarId": cal}})
+                        deleted_fallback_lines.append(fallback)
                     did_mutation = True
-                    deleted_pretty_lines.append(pretty or f"- id={eid} (calendar={cal})")
                 except HTTPException as ex:
                     replies.append(f"일정 삭제 중 오류가 발생했어요: {ex.detail}")
                     actions.append({"ok": False, "error": "not_found"})
 
-            if deleted_pretty_lines:
-                replies.append("🗑️ 다음 일정을 삭제했어요:\n" + "\n".join(f"- {line}" for line in deleted_pretty_lines))
+            if deleted_events_for_block:
+                block = _render_list_block(deleted_events_for_block, indices=deleted_indices_for_block)
+                replies.append("🗑️ 다음 일정을 삭제했어요:\n" + ZERO + "\n" + block)
+            if deleted_fallback_lines:
+                replies.append("🗑️ 다음 항목은 스냅샷이 없어 간략히 표시했어요:\n" + "\n".join(deleted_fallback_lines))
             continue
 
-        # ===== 상세(인덱스) =====
+        # 상세 by 인덱스
         if name == "get_event_detail_by_index":
             idx = int(args["index"])
             pair = _map_index_to_pair(sid, idx)
@@ -716,7 +719,7 @@ def chat(input: ChatIn):
                 actions.append({"ok": False, "error": "not_found"})
             continue
 
-        # ===== 상세(id/index) =====
+        # 상세 by 아이디/인덱스
         if name == "get_event_detail":
             event_id = None
             cal_id = None
@@ -741,7 +744,7 @@ def chat(input: ChatIn):
                 actions.append({"ok": False, "error": "not_found"})
             continue
 
-        # ===== 편집 시작 =====
+        # 편집 시작
         if name == "start_edit":
             event_id = None
             cal_id = None
@@ -776,7 +779,6 @@ def chat(input: ChatIn):
         replies.append("\n변경 후 최신 목록입니다:\n" + ZERO + "\n" + (block if block else "남아있는 일정이 없어요."))
         actions.append({"list": [{"idx": i + 1, **_pack_g(e)} for i, e in enumerate(items)]})
 
-    # B) tool_calls가 있었던 단계 → 헬퍼 제거
     reply = "\n\n".join(replies) if replies else "완료했습니다."
     reply = _sanitize_llm_reply_text(reply, allow_helper=False)
     return ChatOut(reply=reply, tool_result={"actions": actions})

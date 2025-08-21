@@ -14,11 +14,11 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 logger.info("[GoogleOAuth] BACKEND CLIENT_ID=%s****** (loaded=%s)",
             GOOGLE_CLIENT_ID[:6], bool(GOOGLE_CLIENT_ID))
 
-TOKENS = {}  # session_id -> token bundle
+TOKENS = {}
 
 class CodeIn(BaseModel):
     code: str
-    redirect_uri: str   # 'postmessage'
+    redirect_uri: str
     session_id: str
 
 def _exchange_code(code: str, redirect_uri: str):

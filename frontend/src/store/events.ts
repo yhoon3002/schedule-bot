@@ -1,4 +1,3 @@
-// src/store/events.ts
 import { defineStore } from "pinia";
 import axiosInstance from "../utils/axiosInstance";
 import { getSessionId } from "../utils/session";
@@ -51,7 +50,7 @@ export const useEventsStore = defineStore("events", {
             const session_id = getSessionId();
             await axiosInstance.post("/google/calendar/events", {
                 session_id,
-                summary: payload.title, // 서버가 summary를 title로 매핑
+                summary: payload.title,
                 start: payload.start,
                 end: payload.end,
                 description: payload.description ?? null,

@@ -1,4 +1,3 @@
-<!-- src/components/AuthGateComponent.vue -->
 <template>
     <div
         class="w-screen min-h-screen flex items-center justify-center bg-[#f8f8ff]"
@@ -32,10 +31,10 @@ export default defineComponent({
     name: "AuthGateComponent",
     setup() {
         const user = useUserStore();
-        // ✅ 옵션 A: 팝업 1회로 로그인+연동
         const start = async () => {
             await user.loginAndConnect();
         };
+
         return { user, start };
     },
 });

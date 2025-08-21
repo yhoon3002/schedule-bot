@@ -39,15 +39,15 @@ def _normalize_rfc3339(s: Optional[str]) -> Optional[str]:
         return s
     return s + "Z"
 
+# 캘린더 ID 경로-세그먼트 인코딩
 def _cid(s: str) -> str:
-    # 캘린더 ID 경로-세그먼트 인코딩
     return quote(s, safe='@._-+%')
 
+# 이벤트 ID 경로-세그먼트 인코딩
 def _eid(s: str) -> str:
-    # 이벤트 ID 경로-세그먼트 인코딩
     return quote(s, safe='@._-+%')
 
-# ---- 캘린더 리스트 ----
+# 캘린더 리스트
 def gcal_list_calendar_list(session_id: str) -> List[Dict[str, Any]]:
     headers = _auth_header(session_id)
     r = requests.get(f"{GCAL_BASE}/users/me/calendarList", headers=headers, timeout=20)
@@ -73,7 +73,7 @@ def _cal_type(cal: Dict[str, Any]) -> str:
         return "birthday"
     return "normal"
 
-# ---- 개별 캘린더 이벤트 조회 ----
+# 개별 캘린더 이벤트 조회
 def _list_events_for_calendar(
     session_id: str,
     calendar_id: str,
@@ -109,7 +109,7 @@ def _list_events_for_calendar(
         it["_calendarId"] = calendar_id
     return items
 
-# ---- 모든 캘린더에서 모아오기 ----
+# 모든 캘린더에서 모아오기
 def gcal_list_events_all(
     session_id: str,
     time_min: Optional[str],
@@ -163,7 +163,7 @@ def gcal_list_events_all(
     all_items.sort(key=_start_key)
     return all_items
 
-# ---- 단건 조회/CRUD ----
+# 단건 조회/CRUD
 def gcal_get_event(session_id: str, calendar_id: str, event_id: str) -> Dict[str, Any]:
     headers = _auth_header(session_id)
     r = requests.get(
@@ -225,6 +225,10 @@ def gcal_insert_event(
     item["_calendarId"] = calendar_id
     return item
 
+
+# 기본적으로 넘어온 calendar_id에서 패치.
+# 만약 404(Not Found)면, 내 캘린더 전체를 훑어서 해당 event_id가 존재하는 실제 캘린더를 찾은 뒤
+# 거기에 다시 패치(일부 상황에서 스냅샷 불일치로 캘린더가 틀릴 수 있음).
 def gcal_patch_event(
     session_id: str,
     event_id: str,
@@ -232,12 +236,6 @@ def gcal_patch_event(
     calendar_id: str = "primary",
     send_updates: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    이벤트 부분 수정.
-    - 기본적으로 넘어온 calendar_id에서 패치.
-    - 만약 404(Not Found)면, 내 캘린더 전체를 훑어서 해당 event_id가 존재하는 실제 캘린더를 찾은 뒤
-      거기에 다시 패치(일부 상황에서 스냅샷 불일치로 캘린더가 틀릴 수 있음).
-    """
     headers = _auth_header(session_id)
     b = dict(body)
     payload: Dict[str, Any] = {}
@@ -267,7 +265,6 @@ def gcal_patch_event(
     if send_updates:
         params["sendUpdates"] = send_updates
 
-    # 1차 시도
     url = f"{GCAL_BASE}/calendars/{_cid(calendar_id)}/events/{_eid(event_id)}"
     r = requests.patch(url, headers=headers, params=params, json=payload, timeout=20)
     if r.ok:
@@ -275,7 +272,7 @@ def gcal_patch_event(
         item["_calendarId"] = calendar_id
         return item
 
-    # 404일 때만 재시도 (다른 캘린더에 있을 가능성)
+    # 404일 때
     if r.status_code == 404:
         logger.warning("Patch 404 on %s @ %s. Retrying by probing calendars...", event_id, calendar_id)
         try:
@@ -315,7 +312,7 @@ def gcal_delete_event(
         logger.error("Delete event failed: %s | %s", r.status_code, r.text)
         raise HTTPException(502, "Google Calendar delete failed")
 
-# ================== REST (옵션) ==================
+# REST(옵션)
 @router.get("/events")
 def list_events(
     session_id: str = Query(...),
