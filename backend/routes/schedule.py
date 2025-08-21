@@ -24,13 +24,13 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 KST = timezone(timedelta(hours=9))
 CAL_SCOPE = "https://www.googleapis.com/auth/calendar"
 
-# 영어 요일을 한글로 바꿀때 사용
+# 요일 표기(한글)
 WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
 
 # 이메일 검증
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
-# 입력을 [valid_emails], [invalid_values]로 분리.
+# 입력을 [valid_emails], [invalid_values]로 분리
 def _split_valid_invalid_attendees(v):
     if v is None:
         return [], []
@@ -64,6 +64,8 @@ def _must_google_connected(session_id: str):
     if not ok:
         raise HTTPException(status_code=401, detail="Google 로그인/캘린더 연동이 필요합니다.")
 
+# -------------------------- 도구 스펙 --------------------------
+
 ALLOWED_TOOLS = {
     "create_event",
     "list_events",
@@ -74,14 +76,18 @@ ALLOWED_TOOLS = {
     "start_edit",
 }
 
+# 고정 키워드에 의존하지 않도록, 모델이 스스로 자연어를 해석해 from/to 및 filters를 구성하도록 설계
 TOOLS_SPEC = [
     {
         "type": "function",
         "function": {
             "name": "create_event",
             "description": (
-                "Create a Google Calendar event. If attendees are provided and user didn't specify email sending, ask first.\n"
-                "Use KST. If end is omitted or <= start, treat as start+1h."
+                "Google Calendar 이벤트 생성.\n"
+                "- KST 기준.\n"
+                "- 종료가 없거나 시작보다 빠르면 시작+1h로 보정.\n"
+                "- 참석자가 있고 notify_attendees가 명시되지 않았다면, 확인 단계에서 메일 발송 여부를 묻는다.\n"
+                "- confirmed=true 일 때만 실제 생성한다(요약 확인 1회 원칙)."
             ),
             "parameters": {
                 "type": "object",
@@ -96,6 +102,10 @@ TOOLS_SPEC = [
                         "type": "boolean",
                         "description": "true면 참석자 초대메일 발송, false면 발송 안함",
                     },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "요약 확인 후 실제 실행하려면 true로 보낸다.",
+                    },
                     "session_id": {"type": "string"},
                 },
                 "required": ["title", "start"],
@@ -108,11 +118,11 @@ TOOLS_SPEC = [
         "function": {
             "name": "list_events",
             "description": (
-                "List events in the user's calendars.\n"
-                "-> Use this to implement natural-language filters like '오늘', '이번달', '이번 주', '내일', 특정 제목 키워드 등.\n"
-                "-> Fill 'from' and 'to' as ISO 8601 (KST). Examples of mapping: 오늘=[오늘 00:00, 내일 00:00), 이번달=[이달 1일 00:00, 다음달 1일 00:00).\n"
-                "-> For title/keyword filters, set 'query' to the phrase (e.g., '약먹어', '회의').\n"
-                "Do NOT include holidays/birthdays unless the user asks."
+                "사용자 일정 조회. 모델이 자연어를 해석하여 시간 범위와 세부 필터를 설정해 호출한다.\n"
+                "- from/to는 ISO 8601 문자열(KST)로 전달.\n"
+                "- 공휴일/생일 포함 여부도 제어 가능.\n"
+                "- filters로 일정 항목(제목/설명/위치/참석자 유무/참석자 이메일/종일 여부/상태/기간 등)을 세밀하게 필터링한다.\n"
+                "- 반환은 서버가 번호(1) 스타일로 렌더링한다."
             ),
             "parameters": {
                 "type": "object",
@@ -122,6 +132,27 @@ TOOLS_SPEC = [
                     "query": {"type": "string"},
                     "include_holidays": {"type": "boolean", "default": False},
                     "include_birthdays": {"type": "boolean", "default": False},
+                    "filters": {
+                        "type": "object",
+                        "description": "세부 필터(모두 선택적)",
+                        "properties": {
+                            "title_includes": {"type": "array", "items": {"type": "string"}},
+                            "title_excludes": {"type": "array", "items": {"type": "string"}},
+                            "description_includes": {"type": "array", "items": {"type": "string"}},
+                            "description_excludes": {"type": "array", "items": {"type": "string"}},
+                            "location_includes": {"type": "array", "items": {"type": "string"}},
+                            "location_excludes": {"type": "array", "items": {"type": "string"}},
+                            "has_attendees": {"type": "boolean"},
+                            "attendee_emails_includes": {"type": "array", "items": {"type": "string"}},
+                            "has_location": {"type": "boolean"},
+                            "is_all_day": {"type": "boolean"},
+                            "min_duration_minutes": {"type": "integer"},
+                            "max_duration_minutes": {"type": "integer"},
+                            "status": {"type": "string", "description": "confirmed/tentative/cancelled 등"},
+                            "calendar_ids_includes": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "additionalProperties": False,
+                    },
                     "session_id": {"type": "string"},
                 },
                 "additionalProperties": False,
@@ -133,8 +164,10 @@ TOOLS_SPEC = [
         "function": {
             "name": "update_event",
             "description": (
-                "Update a Google Calendar event. Pass id or last-list 1-based index.\n"
-                "When modifying attendees and user didn't specify email sending, ask first."
+                "Google Calendar 이벤트 수정. id 또는 마지막 조회 인덱스로 지정.\n"
+                "- start만 변경되고 end가 없거나 start>=end면 start+1h로 보정.\n"
+                "- 참석자 변경 시 notify_attendees가 명시되지 않았다면 확인 단계에서 묻는다.\n"
+                "- confirmed=true 일 때만 실제 수정한다(요약 확인 1회 원칙)."
             ),
             "parameters": {
                 "type": "object",
@@ -157,6 +190,10 @@ TOOLS_SPEC = [
                         "type": "boolean",
                         "description": "true면 참석자 초대메일 발송, false면 발송 안함",
                     },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "요약 확인 후 실제 실행하려면 true로 보낸다.",
+                    },
                     "session_id": {"type": "string"},
                 },
                 "required": ["patch"],
@@ -169,8 +206,9 @@ TOOLS_SPEC = [
         "function": {
             "name": "delete_event",
             "description": (
-                "Delete events. Use exactly one of: indexes, index, ids, id.\n"
-                "For natural-language like '오늘 약먹어 일정 삭제', first call list_events with from/to+query, then call delete_event with resulting indexes."
+                "이벤트 삭제. indexes/index/ids/id 중 하나만 사용.\n"
+                "- 자연어로 지정된 범위/필터는 먼저 list_events로 추려서, 그 결과 인덱스로 삭제.\n"
+                "- confirmed=true 일 때만 실제 삭제한다(요약 확인 1회 원칙)."
             ),
             "parameters": {
                 "type": "object",
@@ -179,6 +217,10 @@ TOOLS_SPEC = [
                     "ids": {"type": "array", "items": {"type": "string"}},
                     "index": {"type": "integer", "minimum": 1},
                     "indexes": {"type": "array", "items": {"type": "integer"}},
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "요약 확인 후 실제 실행하려면 true로 보낸다.",
+                    },
                     "session_id": {"type": "string"},
                 },
                 "additionalProperties": False,
@@ -189,10 +231,7 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "get_event_detail",
-            "description": (
-                "Get event detail by id or 1-based index from the last list.\n"
-                "Use this after filtering (e.g., when user asks '~~일정 참석자 알려줘')."
-            ),
+            "description": "id 또는 마지막 조회 인덱스로 상세 보기(참석자 포함).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -208,7 +247,7 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "get_event_detail_by_index",
-            "description": "Get event detail by last-list index (1-based).",
+            "description": "마지막 조회 인덱스(1-base)로 상세 보기.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -224,7 +263,7 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "start_edit",
-            "description": "User wants to edit but didn’t specify fields. Pass id or index.",
+            "description": "편집 시작(필드 미지정 시). id 또는 인덱스로 대상 선택.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -238,8 +277,11 @@ TOOLS_SPEC = [
     },
 ]
 
+# 세션 상태
 SESSION_LAST_LIST: Dict[str, List[Tuple[str, str]]] = {}
 SESSION_LAST_ITEMS: Dict[str, List[Dict[str, Any]]] = {}
+
+# -------------------------- OpenAI 호출 --------------------------
 
 def _openai_chat(messages):
     if not OPENAI_API_KEY:
@@ -263,7 +305,7 @@ def _openai_chat(messages):
         raise HTTPException(500, "LLM call failed")
     return r.json()
 
-# ---- Time helpers ----
+# -------------------------- 시간/포맷 유틸 --------------------------
 
 def _get_kst(dt_str: Optional[str]):
     if not dt_str:
@@ -282,63 +324,8 @@ def _fmt_kst_time(dt: Optional[datetime]) -> str:
         return "없음"
     return dt.strftime("%H:%M")
 
-# ---- Render helpers ----
-
-def _line_required_g(e: dict) -> str:
-    title = e.get("summary") or "(제목 없음)"
-    st = _get_kst(e.get("start", {}).get("dateTime") or e.get("start", {}).get("date"))
-    ed_raw = e.get("end", {}).get("dateTime") or e.get("end", {}).get("date")
-    ed = _get_kst(ed_raw) if ed_raw else None
-    s = f"{_fmt_kst_date(st)} {_fmt_kst_time(st)}" if st else "없음"
-    e_ = f"{_fmt_kst_date(ed)} {_fmt_kst_time(ed)}" if ed else "없음"
-    return f"{title}\n{s} ~ {e_}"
-
-def _fmt_detail_g(e: dict) -> str:
-    title = e.get("summary") or "(제목 없음)"
-    st = _get_kst(e.get("start", {}).get("dateTime") or e.get("start", {}).get("date"))
-    ed_raw = e.get("end", {}).get("dateTime") or e.get("end", {}).get("date")
-    ed = _get_kst(ed_raw) if ed_raw else None
-    s_date = _fmt_kst_date(st)
-    s_time = _fmt_kst_time(st)
-    e_date = _fmt_kst_date(ed)
-    e_time = _fmt_kst_time(ed)
-    desc = (e.get("description") or "").strip() or "없음"
-    loc = (e.get("location") or "").strip() or "없음"
-    attendees = e.get("attendees") or []
-    atts = ", ".join([a.get("email") for a in attendees if a.get("email")]) or "없음"
-    return (
-        "📄 일정 상세 정보:\n"
-        f"- 제목: {title}\n- 시작 날짜: {s_date}\n- 시작 시간: {s_time}\n"
-        f"- 종료 날짜: {e_date}\n- 종료 시간: {e_time}\n"
-        f"- 설명: {desc}\n- 위치: {loc}\n- 참석자: {atts}"
-    )
-
-def _pack_g(e: dict) -> dict:
-    start = e.get("start", {})
-    end = e.get("end", {})
-    return {
-        "id": e.get("id"),
-        "calendarId": e.get("_calendarId"),
-        "title": e.get("summary") or "(제목 없음)",
-        "start": start.get("dateTime") or start.get("date"),
-        "end": end.get("dateTime") or end.get("date"),
-        "description": e.get("description"),
-        "location": e.get("location"),
-        "attendees": [
-            a.get("email") for a in (e.get("attendees") or []) if a.get("email")
-        ],
-    }
-
-# Snapshot helpers
-
-def _find_snapshot_item(sid: str, event_id: str, cal_id: str) -> Optional[Dict[str, Any]]:
-    items = SESSION_LAST_ITEMS.get(sid) or []
-    for e in items:
-        if e.get("id") == event_id and (e.get("_calendarId") or "primary") == (cal_id or "primary"):
-            return e
-    return None
-
-# 시간 파싱 유틸
+def _rfc3339(dt: datetime) -> str:
+    return dt.astimezone(KST).isoformat()
 
 def _parse_dt(dt_str: Optional[str]) -> Optional[datetime]:
     if not dt_str:
@@ -355,59 +342,8 @@ def _parse_dt(dt_str: Optional[str]) -> Optional[datetime]:
     except Exception:
         return None
 
-def _rfc3339(dt: datetime) -> str:
-    return dt.astimezone(KST).isoformat()
+# -------------------------- 출력 포맷/후처리 --------------------------
 
-# ---------------- System policy for the LLM ----------------
-SYSTEM_POLICY_TEMPLATE = """
-You are ScheduleBot. Google Calendar 연결 사용자의 일정만 처리합니다.
-- Respond in Korean.
-- 시간대는 Asia/Seoul (KST). ISO 8601 사용.
-
-[핵심 원칙]
-- 사용자의 자연어를 스스로 해석해 필요한 도구 호출을 **연쇄적으로** 수행합니다.
-- 서버 측 키워드 매칭은 사용하지 않습니다. (LLM이 판단)
-- 가능하면 재질문하지 말고, 합리적으로 가정하여 진행하세요.
-- 참석자가 1명 이상인 생성/수정 작업은 확정 후 한 번만 초대 메일 여부(예/아니오)를 물어봅니다.
-- **사용자에게 ISO 예시를 보여주지 마세요.** (도구 호출에만 사용)
-
-[의도 판별]
-- 생성 / 목록 / 상세 / 참석자 조회 / 수정 / 삭제.
-- "~일정 참석자 알려줘" ⇒ 필터링해서 단일 후보면 상세 조회(get_event_detail)로 참석자까지 보여주기.
-- "오늘/이번달/이번 주/내일/어제" 등 기간 지시어와 제목/키워드(예: "약먹어")를 함께 해석.
-
-[자연어 기간 → from/to (모두 KST, ISO 8601)]
-- 오늘: [오늘 00:00, 내일 00:00)
-- 내일: [내일 00:00, 모레 00:00)
-- 어제: [어제 00:00, 오늘 00:00)
-- 이번 주: [이번 주 월요일 00:00, 다음 주 월요일 00:00)  ※ 주 시작은 월요일
-- 다음 주: [다음 주 월요일 00:00, 다다음 주 월요일 00:00)
-- 이번달: [이번달 1일 00:00, 다음달 1일 00:00)
-- 다음달: [다음달 1일 00:00, 다다음달 1일 00:00)
-
-[도구 사용 지침]
-- 목록(list_events): 위 기간 규칙에 따라 from/to를 채우고, 제목/키워드는 query에 입력. 공휴일/생일은 요청 있을 때만 포함.
-- 삭제(delete_event): 자연어로 범위+키워드가 오면 (1) list_events로 필터링 → (2) 결과 인덱스로 delete_event 호출. 결과가 0개면 친절히 안내.
-- 참석자 요청: (1) list_events로 필터링 → 후보가 1개면 get_event_detail, 여러 개면 번호 선택 유도.
-- 생성(create_event): 종료 누락 또는 종료<=시작이면 시작+1시간으로 도구 호출.
-- 수정(update_event): start만 변경이고 end가 없거나 start>=end면 start+1시간으로 보정.
-
-[샘플 시나리오 (도구 호출 예)]
-1) "오늘 약먹어 일정 삭제해줘"
-   - list_events {from=오늘 00:00, to=내일 00:00, query="약먹어"}
-   - delete_event {indexes=[1,2,...]}  (목록 결과 기준)
-
-2) "이번달 일정 알려줘"
-   - list_events {from=이번달 1일 00:00, to=다음달 1일 00:00}
-
-3) "프로젝트 킥오프 일정 참석자 알려줘"
-   - list_events {query="프로젝트 킥오프"}
-   - (후보 1개면) get_event_detail {index=1}
-
-현재 시각(KST): {NOW_ISO}, Today: {TODAY_FRIENDLY}.
-"""
-
-# 출력 후처리(ISO -> 한국식 변환)
 ISO_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?")
 ISO_PAREN_EXAMPLE_RE = re.compile(
     r"\s*\([^)]*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?[^)]*\)\s*"
@@ -442,8 +378,50 @@ def _sanitize_llm_reply_text(text: str, *, allow_helper: bool) -> str:
     cleaned = "\n".join(out_lines).strip()
     return cleaned or text
 
-# 목록 블록(번호/줄바꿈 일관화)
+# 공백/들여쓰기 도우미
 ZERO = "\u200B"  # 한 줄 공백 효과
+INDENT_ITEM = "  "        # 목록용(한 번)
+INDENT_SECTION = "    "   # 문단용(두 번)
+
+def _indent_block(text: str, level: int = 1) -> str:
+    prefix = "  " * level
+    return "\n".join((prefix + ln) if ln.strip() else ln for ln in text.splitlines())
+
+# 목록 블록(항상 1. 2. 3. ...)
+def _line_required_g(e: dict) -> str:
+    title = e.get("summary") or "(제목 없음)"
+    st = _get_kst(e.get("start", {}).get("dateTime") or e.get("start", {}).get("date"))
+    ed_raw = e.get("end", {}).get("dateTime") or e.get("end", {}).get("date")
+    ed = _get_kst(ed_raw) if ed_raw else None
+    s = f"{_fmt_kst_date(st)} {_fmt_kst_time(st)}" if st else "없음"
+    e_ = f"{_fmt_kst_date(ed)} {_fmt_kst_time(ed)}" if ed else "없음"
+    return f"{title}\n{s} ~ {e_}"
+
+def _fmt_detail_g(e: dict) -> str:
+    title = e.get("summary") or "(제목 없음)"
+    st = _get_kst(e.get("start", {}).get("dateTime") or e.get("start", {}).get("date"))
+    ed_raw = e.get("end", {}).get("dateTime") or e.get("end", {}).get("date")
+    ed = _get_kst(ed_raw) if ed_raw else None
+    s_date = _fmt_kst_date(st)
+    s_time = _fmt_kst_time(st)
+    e_date = _fmt_kst_date(ed)
+    e_time = _fmt_kst_time(ed)
+    desc = (e.get("description") or "").strip() or "없음"
+    loc = (e.get("location") or "").strip() or "없음"
+    attendees = e.get("attendees") or []
+    atts = ", ".join([a.get("email") for a in attendees if a.get("email")]) or "없음"
+    # 상태/종일은 사용자에게 불필요하므로 표시하지 않음
+    return (
+        "📄 일정 상세 정보:\n"
+        f"- 제목: {title}\n"
+        f"- 시작 날짜: {s_date}\n"
+        f"- 시작 시간: {s_time}\n"
+        f"- 종료 날짜: {e_date}\n"
+        f"- 종료 시간: {e_time}\n"
+        f"- 설명: {desc}\n"
+        f"- 위치: {loc}\n"
+        f"- 참석자: {atts}"
+    )
 
 def _render_list_block(items: List[dict], *, indices: Optional[List[int]] = None) -> str:
     out: List[str] = []
@@ -451,25 +429,147 @@ def _render_list_block(items: List[dict], *, indices: Optional[List[int]] = None
         no = (indices[idx - 1] if indices and len(indices) >= idx else idx)
         two = _line_required_g(e)
         title, time_range = (two.split("\n", 1) + [""])[:2]
-        out.append(f"{no}\\) {title}")
+        out.append(f"{no}. {title}")
         if time_range:
             out.append(time_range)
         if idx != len(items):
             out.append(ZERO)
     return "\n".join(out)
 
-# 입출력 모델
-class ChatIn(BaseModel):
-    user_message: str
-    history: Optional[list] = None
-    session_id: Optional[str] = None
+def _pack_g(e: dict) -> dict:
+    start = e.get("start", {})
+    end = e.get("end", {})
+    return {
+        "id": e.get("id"),
+        "calendarId": e.get("_calendarId"),
+        "title": e.get("summary") or "(제목 없음)",
+        "start": start.get("dateTime") or start.get("date"),
+        "end": end.get("dateTime") or end.get("date"),
+        "description": e.get("description"),
+        "location": e.get("location"),
+        "attendees": [
+            a.get("email") for a in (e.get("attendees") or []) if a.get("email")
+        ],
+        "status": e.get("status"),
+    }
 
-class ChatOut(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-    reply: str
-    tool_result: Optional[Any] = None
+# -------------------------- 필터링 유틸 --------------------------
 
-# Snapshot mapping helpers
+def _ci_contains(text: Optional[str], needle: str) -> bool:
+    if text is None:
+        return False
+    try:
+        return needle.lower() in text.lower()
+    except Exception:
+        return False
+
+def _any_ci_contains(text: Optional[str], needles: List[str]) -> bool:
+    return all(_ci_contains(text, n) for n in needles) if needles else True
+
+def _none_ci_contains(text: Optional[str], needles: List[str]) -> bool:
+    return not any(_ci_contains(text, n) for n in needles) if needles else True
+
+def _attendee_emails(e: dict) -> List[str]:
+    return [a.get("email", "").lower() for a in (e.get("attendees") or []) if a.get("email")]
+
+def _is_all_day_event(e: dict) -> bool:
+    s = e.get("start", {})
+    return "date" in s and "dateTime" not in s
+
+def _duration_minutes(e: dict) -> Optional[int]:
+    st = _get_kst(e.get("start", {}).get("dateTime") or e.get("start", {}).get("date"))
+    ed_raw = e.get("end", {}).get("dateTime") or e.get("end", {}).get("date")
+    ed = _get_kst(ed_raw) if ed_raw else None
+    if st and ed:
+        return int((ed - st).total_seconds() // 60)
+    return None
+
+def _apply_filters(items: List[dict], filters: Optional[dict]) -> List[dict]:
+    if not filters:
+        return items
+
+    ti = filters.get("title_includes") or []
+    te = filters.get("title_excludes") or []
+    di = filters.get("description_includes") or []
+    de = filters.get("description_excludes") or []
+    li = filters.get("location_includes") or []
+    le = filters.get("location_excludes") or []
+    has_at = filters.get("has_attendees", None)
+    email_in = [x.lower() for x in (filters.get("attendee_emails_includes") or [])]
+    has_loc = filters.get("has_location", None)
+    is_all_day = filters.get("is_all_day", None)
+    min_d = filters.get("min_duration_minutes", None)
+    max_d = filters.get("max_duration_minutes", None)
+    status = (filters.get("status") or "").lower().strip()
+    cals_in = [x for x in (filters.get("calendar_ids_includes") or [])]
+
+    out = []
+    for e in items:
+        title = e.get("summary") or ""
+        desc = e.get("description") or ""
+        loc = e.get("location") or ""
+        emails = _attendee_emails(e)
+        dur = _duration_minutes(e)
+        st = (e.get("status") or "").lower()
+        cal_id = e.get("_calendarId") or "primary"
+
+        if not _any_ci_contains(title, ti):
+            continue
+        if not _none_ci_contains(title, te):
+            continue
+        if not _any_ci_contains(desc, di):
+            continue
+        if not _none_ci_contains(desc, de):
+            continue
+        if not _any_ci_contains(loc, li):
+            continue
+        if not _none_ci_contains(loc, le):
+            continue
+
+        if has_at is True and len(emails) == 0:
+            continue
+        if has_at is False and len(emails) > 0:
+            continue
+        if email_in:
+            lower_emails = set(emails)
+            if not any(any(em in ae for ae in lower_emails) for em in email_in):
+                continue
+
+        if has_loc is True and not loc.strip():
+            continue
+        if has_loc is False and loc.strip():
+            continue
+
+        if is_all_day is True and not _is_all_day_event(e):
+            continue
+        if is_all_day is False and _is_all_day_event(e):
+            continue
+
+        if min_d is not None:
+            if dur is None or dur < int(min_d):
+                continue
+        if max_d is not None:
+            if dur is None or dur > int(max_d):
+                continue
+
+        if status and st != status:
+            continue
+
+        if cals_in and cal_id not in cals_in:
+            continue
+
+        out.append(e)
+
+    return out
+
+# -------------------------- 스냅샷/매핑 --------------------------
+
+def _find_snapshot_item(sid: str, event_id: str, cal_id: str) -> Optional[Dict[str, Any]]:
+    items = SESSION_LAST_ITEMS.get(sid) or []
+    for e in items:
+        if e.get("id") == event_id and (e.get("_calendarId") or "primary") == (cal_id or "primary"):
+            return e
+    return None
 
 def _map_index_to_pair(sid: str, idx: int) -> Optional[Tuple[str, str]]:
     pairs = SESSION_LAST_LIST.get(sid) or []
@@ -482,9 +582,47 @@ def _find_cal_for_id(sid: str, event_id: str) -> Optional[str]:
     cal = next((c for (eid, c) in pairs if eid == event_id), None)
     if cal:
         return cal
-    items = gcal_list_events_all(sid, None, None, None)
+    items = gcal_list_events_all(sid, None, None, None, False, False)
     hit = next((x for x in items if x.get("id") == event_id), None)
     return (hit.get("_calendarId") if hit else None)
+
+# -------------------------- 시스템 프롬프트 --------------------------
+
+SYSTEM_POLICY_TEMPLATE = """
+You are ScheduleBot. Google Calendar 연결 사용자의 일정만 처리합니다.
+
+- 한국어로 답변합니다.
+- 모든 시간대는 Asia/Seoul(KST)을 기준으로 하며, 내부적으로 ISO 8601을 사용합니다.
+- 사용자에게는 ISO 형식을 노출하지 않습니다.
+
+[핵심 원칙]
+- **고정된 단어/문장 규칙에 의존하지 말고**, 사용자의 자연어를 스스로 이해해 의도(조회/상세/생성/수정/삭제/필터링)를 판별하고 필요한 도구 호출을 연쇄적으로 수행하세요.
+- 시간 범위 역시 모델이 스스로 계산하여 from/to에 넣으세요(예: “이번달”, “내일 오전”, “다음 주말” 등). 서버는 별도 키워드 매칭을 하지 않습니다.
+- 일정 목록은 항상 번호를 붙여 보여줍니다(예: `1.` 형식). 목록은 들여쓰기 한 번, 문단은 들여쓰기 두 번을 적용해 가독성을 높입니다.
+- 생성/수정/삭제는 반드시 **요약 → 확인(예/아니오) → 실행** 순서로, 확인 질문은 **단 한 번만** 합니다. 실제 실행 시 해당 도구 호출에 `confirmed=true` 를 반드시 포함하세요.
+- 참석자가 1명 이상인 생성/수정은, 사용자가 메일 발송 의사를 명시하지 않은 경우 확인 단계에서 한 번만 질문합니다(`notify_attendees`).
+
+[필터링]
+- 시간 범위뿐만 아니라 제목/설명/위치/참석자 유무/참석자 이메일/종일 여부/상태/기간/캘린더 등 다양한 조건으로 필터링할 수 있습니다.
+- 이 조건들은 list_events의 `filters` 필드로 표현하세요. 서버는 추가로 후처리 필터링을 적용합니다.
+
+현재 시각(KST): {NOW_ISO}
+Today: {TODAY_FRIENDLY}
+"""
+
+# -------------------------- 입출력 모델 --------------------------
+
+class ChatIn(BaseModel):
+    user_message: str
+    history: Optional[list] = None
+    session_id: Optional[str] = None
+
+class ChatOut(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    reply: str
+    tool_result: Optional[Any] = None
+
+# -------------------------- 엔드포인트 --------------------------
 
 @router.post("/chat", response_model=ChatOut)
 def chat(input: ChatIn):
@@ -506,8 +644,7 @@ def chat(input: ChatIn):
     tool_calls = choice.get("message", {}).get("tool_calls") or []
 
     if not tool_calls:
-        reply = choice["message"].get("content") or "일정 관련 요청을 말씀해 주세요."
-        # 첫 질문에만 헬퍼 사용
+        reply = choice["message"].get("content") or "일정 관련 요청을 말씀해 주세요.\n\n예) 이번달 내 일정은? / 참석자 있는 일정만 보여줘 / '약'으로 등록된 일정 삭제"
         reply = _sanitize_llm_reply_text(reply, allow_helper=True)
         return ChatOut(reply=reply, tool_result=None)
 
@@ -515,12 +652,16 @@ def chat(input: ChatIn):
     actions: List[Dict[str, Any]] = []
     did_mutation = False
 
+    # 여러 개 생성/수정이 한 턴에 발생하면 마지막에 번호 붙여 묶어서 보여주기
+    created_events_agg: List[dict] = []
+    updated_events_agg: List[dict] = []
+
     for tc in tool_calls:
         name = tc["function"]["name"]
         raw_args = tc["function"].get("arguments") or "{}"
         args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
 
-        # 목록
+        # ---------------- 조회(리스트) ----------------
         if name == "list_events":
             items = gcal_list_events_all(
                 sid,
@@ -530,41 +671,42 @@ def chat(input: ChatIn):
                 bool(args.get("include_holidays", False)),
                 bool(args.get("include_birthdays", False)),
             )
-            SESSION_LAST_LIST[sid] = [(it.get("id"), it.get("_calendarId") or "primary") for it in items]
-            SESSION_LAST_ITEMS[sid] = items
 
-            if not items:
-                replies.append("해당 조건에 맞는 일정이 없어요.")
+            # 서버 측 세부 필터 후처리(모델이 보낸 filters 반영)
+            filtered = _apply_filters(items, args.get("filters") or {})
+
+            SESSION_LAST_LIST[sid] = [(it.get("id"), it.get("_calendarId") or "primary") for it in filtered]
+            SESSION_LAST_ITEMS[sid] = filtered
+
+            if not filtered:
+                replies.append("  조건에 맞는 일정이 없어요.\n\n  필터를 조금 완화해 보시겠어요?")
                 actions.append({"list": []})
-            elif len(items) == 1:
-                e = items[0]
-                replies.append("다음 일정을 찾았어요:\n" + _fmt_detail_g(e))
+            elif len(filtered) == 1:
+                e = filtered[0]
+                replies.append("  다음 일정을 찾았어요:\n\n" + _indent_block(_fmt_detail_g(e), 2))
                 actions.append({"list": [_pack_g(e)]})
             else:
-                block = _render_list_block(items)
-                replies.append(
-                    "여러 개가 있어요. 번호를 선택하시면 상세 정보를 알려드릴게요:\n"
-                    + ZERO + "\n" + block
-                )
-                actions.append({"list": [{"idx": i + 1, **_pack_g(e)} for i, e in enumerate(items)]})
+                block = _render_list_block(filtered)
+                replies.append("  여러 일정이 있어요. 번호를 선택하시면 상세 정보를 보여드릴게요.\n\n" + _indent_block(block, 1))
+                actions.append({"list": [{"idx": i + 1, **_pack_g(e)} for i, e in enumerate(filtered)]})
             continue
 
-        # 생성
+        # ---------------- 생성 ----------------
         if name == "create_event":
             attendees_input = args.get("attendees")
             valid_emails, invalids = _split_valid_invalid_attendees(attendees_input)
             if invalids:
                 replies.append(
-                    "참석자는 이메일 주소로만 입력할 수 있어요.\n"
-                    + "\n".join(f"- {x}" for x in invalids)
-                    + "\n올바른 이메일(예: name@example.com)로 다시 입력해 주세요."
+                    "  참석자는 이메일 주소로만 입력할 수 있어요.\n\n"
+                    + "\n".join(f"  - {x}" for x in invalids)
+                    + "\n\n  올바른 이메일(예: name@example.com)로 다시 알려주세요."
                 )
                 actions.append({"ok": False, "error": "invalid_attendees", "invalid": invalids})
                 continue
 
             start_dt = _parse_dt(args.get("start"))
             if not start_dt:
-                replies.append("시작 시간을 이해하지 못했어요. 예: '8월 25일 13:00'처럼 알려주세요.")
+                replies.append("  시작 시간을 이해하지 못했어요.\n\n  예: '8월 25일 13:00'처럼 자연어로 말씀해 주세요.")
                 actions.append({"ok": False, "error": "bad_start"})
                 continue
             end_dt = _parse_dt(args.get("end"))
@@ -583,18 +725,40 @@ def chat(input: ChatIn):
             if attendees_input is not None:
                 body["attendees"] = valid_emails
 
-            notify = args.get("notify_attendees", None)
+            # 확인 단계(한 번만)
+            if not args.get("confirmed", False):
+                desc = (body.get("description") or "없음")
+                loc = (body.get("location") or "없음")
+                atts = ", ".join(valid_emails) if valid_emails else "없음"
+                notify = args.get("notify_attendees")
+                notify_str = "예" if notify else ("아니오" if notify is not None else "미지정")
+                summary = (
+                    "    이대로 생성할까요?\n\n"
+                    f"    1. 제목: {body['summary']}\n"
+                    f"    2. 시작: {_iso_str_to_kst_friendly(body['start']['dateTime'])}\n"
+                    f"    3. 종료: {_iso_str_to_kst_friendly(body['end']['dateTime'])}\n"
+                    f"    4. 설명: {desc}\n"
+                    f"    5. 위치: {loc}\n"
+                    f"    6. 참석자: {atts}\n"
+                    f"    7. 초대 메일 발송: {notify_str}\n\n"
+                    "    진행할까요? (예/아니오)"
+                )
+                replies.append(summary)
+                actions.append({"ok": False, "need_confirm": True, "preview": body})
+                continue
+
             send_updates = None
-            if valid_emails and notify is not None:
-                send_updates = "all" if notify else "none"
+            if valid_emails:
+                notify = args.get("notify_attendees", None)
+                send_updates = "all" if notify else "none" if notify is not None else None
 
             e = gcal_insert_event(sid, body, send_updates=send_updates)
-            replies.append("✅ 일정 등록:\n(참석자는 이메일 주소로 입력해주세요)\n" + _fmt_detail_g(e))
+            created_events_agg.append(e)
             actions.append({"created": _pack_g(e)})
             did_mutation = True
             continue
 
-        # 수정
+        # ---------------- 수정 ----------------
         if name == "update_event":
             event_id = None
             cal_id = None
@@ -613,7 +777,7 @@ def chat(input: ChatIn):
                     cal_id = _find_cal_for_id(sid, event_id) or "primary"
 
             if not event_id:
-                replies.append("수정할 대상을 찾지 못했어요. 먼저 '전체 일정'으로 목록을 띄워주세요.")
+                replies.append("  수정할 대상을 찾지 못했어요.\n\n  먼저 '일정 목록'을 띄워주세요.")
                 actions.append({"ok": False, "error": "not_found"})
                 continue
 
@@ -630,10 +794,15 @@ def chat(input: ChatIn):
             if new_end_dt:
                 body.setdefault("end", {})["dateTime"] = _rfc3339(new_end_dt)
 
-            # start만 바뀌고 end가 없거나 start>=end면 start+1h로 보정
+            snapshot_before = None
+            try:
+                snapshot_before = gcal_get_event(sid, cal_id or "primary", event_id)
+            except HTTPException:
+                pass
+
+            # start만 바뀌고 end가 없거나 start>=end면 start+1h 보정
             if new_start_dt and (not new_end_dt):
-                cur = gcal_get_event(sid, cal_id or "primary", event_id)
-                cur_end_dt = _parse_dt(cur.get("end", {}).get("dateTime") or cur.get("end", {}).get("date"))
+                cur_end_dt = _parse_dt(snapshot_before.get("end", {}).get("dateTime") or snapshot_before.get("end", {}).get("date")) if snapshot_before else None
                 if (cur_end_dt is None) or (cur_end_dt <= new_start_dt):
                     body.setdefault("end", {})["dateTime"] = _rfc3339(new_start_dt + timedelta(hours=1))
 
@@ -642,35 +811,72 @@ def chat(input: ChatIn):
             if "location" in p:
                 body["location"] = p["location"]
 
-            send_updates = None
+            valid_emails = None
             if "attendees" in p:
                 valid_emails, invalids = _split_valid_invalid_attendees(p.get("attendees"))
                 if invalids:
                     replies.append(
-                        "참석자는 이메일 주소로만 입력할 수 있어요.\n"
-                        + "\n".join(f"- {x}" for x in invalids)
-                        + "\n올바른 이메일(예: name@example.com)로 다시 알려주세요."
+                        "  참석자는 이메일 주소로만 입력할 수 있어요.\n\n"
+                        + "\n".join(f"  - {x}" for x in invalids)
+                        + "\n\n  올바른 이메일(예: name@example.com)로 다시 알려주세요."
                     )
                     actions.append({"ok": False, "error": "invalid_attendees", "invalid": invalids})
                     continue
                 body["attendees"] = valid_emails
+
+            # 확인 단계(한 번만)
+            if not args.get("confirmed", False):
+                before_str = _fmt_detail_g(snapshot_before) if snapshot_before else "(이전 정보 조회 불가)"
+                after_dummy = snapshot_before.copy() if snapshot_before else {}
+                # after_dummy에 패치 적용(미리보기)
+                if "summary" in body:
+                    after_dummy["summary"] = body["summary"]
+                if "description" in body:
+                    after_dummy["description"] = body["description"]
+                if "location" in body:
+                    after_dummy["location"] = body["location"]
+                if "start" in body:
+                    after_dummy.setdefault("start", {})["dateTime"] = body["start"]["dateTime"]
+                if "end" in body:
+                    after_dummy.setdefault("end", {})["dateTime"] = body["end"]["dateTime"]
+                if "attendees" in body:
+                    after_dummy["attendees"] = [{"email": x} for x in body["attendees"]]
+
                 notify = args.get("notify_attendees", None)
-                if valid_emails and notify is not None:
+                notify_str = "예" if notify else ("아니오" if notify is not None else "미지정")
+
+                preview = (
+                    "    다음과 같이 수정할까요?\n\n"
+                    "    1. 변경 전:\n"
+                    f"{_indent_block(before_str, 3)}\n\n"
+                    "    2. 변경 후(미리보기):\n"
+                    f"{_indent_block(_fmt_detail_g(after_dummy), 3)}\n\n"
+                    f"    3. 초대 메일 발송: {notify_str}\n\n"
+                    "    진행할까요? (예/아니오)"
+                )
+                replies.append(preview)
+                actions.append({"ok": False, "need_confirm": True, "preview_patch": body})
+                continue
+
+            send_updates = None
+            if valid_emails is not None:
+                notify = args.get("notify_attendees", None)
+                if notify is not None:
                     send_updates = "all" if notify else "none"
 
             try:
                 e = gcal_patch_event(
                     sid, event_id, body, cal_id or "primary", send_updates=send_updates
                 )
-                replies.append("🔧 일정 수정 완료:\n" + _fmt_detail_g(e))
+                updated_events_agg.append(e)
                 actions.append({"updated": _pack_g(e)})
                 did_mutation = True
             except HTTPException as ex:
-                replies.append(f"일정 수정 중 오류가 발생했어요: {ex.detail}")
+                replies.append(f"  일정 수정 중 오류가 발생했어요.\n\n  사유: {ex.detail}")
                 actions.append({"ok": False, "error": ex.detail})
             continue
 
-        # 삭제
+        # ---------------- 삭제 ----------------
         if name == "delete_event":
             pairs_snapshot: List[Tuple[str, str]] = list(SESSION_LAST_LIST.get(sid) or [])
 
@@ -700,7 +906,7 @@ def chat(input: ChatIn):
                 if cal:
                     targets.append((eid, cal))
             else:
-                replies.append("삭제할 일정을 찾지 못했어요.")
+                replies.append("  삭제할 일정을 찾지 못했어요.\n\n  먼저 '일정 목록'을 띄워주세요.")
                 actions.append({"ok": False, "error": "not_found"})
                 continue
 
@@ -712,8 +918,33 @@ def chat(input: ChatIn):
                     uniq_targets.append(t)
 
             if not uniq_targets:
-                replies.append("삭제할 일정을 찾지 못했어요.")
+                replies.append("  삭제할 일정을 찾지 못했어요.\n\n  조건을 확인해 주세요.")
                 actions.append({"ok": False, "error": "not_found"})
+                continue
+
+            # 확인 단계(한 번만)
+            if not args.get("confirmed", False):
+                preview_items: List[dict] = []
+                idx_list: List[int] = []
+                fallback_lines: List[str] = []
+                for eid, cal in uniq_targets:
+                    snap = _find_snapshot_item(sid, eid, cal)
+                    if snap:
+                        try:
+                            idx_display = pairs_snapshot.index((eid, cal)) + 1
+                        except ValueError:
+                            idx_display = len(idx_list) + 1
+                        preview_items.append(snap)
+                        idx_list.append(idx_display)
+                    else:
+                        fallback_lines.append(f"- id={eid} (calendar={cal})")
+                preview_text = ""
+                if preview_items:
+                    preview_text += _render_list_block(preview_items, indices=idx_list)
+                if fallback_lines:
+                    preview_text += ("\n" if preview_text else "") + "\n".join(fallback_lines)
+                replies.append("    아래 일정을 삭제할까요?\n\n" + _indent_block(preview_text or "(표시할 항목 없음)", 2) + "\n\n    진행할까요? (예/아니오)")
+                actions.append({"ok": False, "need_confirm": True, "preview_delete": [list(t) for t in uniq_targets]})
                 continue
 
             deleted_events_for_block: List[dict] = []
@@ -723,7 +954,6 @@ def chat(input: ChatIn):
             for eid, cal in uniq_targets:
                 snap = _find_snapshot_item(sid, eid, cal)
                 fallback = f"- id={eid} (calendar={cal})"
-
                 try:
                     gcal_delete_event(sid, eid, cal or "primary")
                     if snap:
@@ -739,35 +969,35 @@ def chat(input: ChatIn):
                         deleted_fallback_lines.append(fallback)
                     did_mutation = True
                 except HTTPException as ex:
-                    replies.append(f"일정 삭제 중 오류가 발생했어요: {ex.detail}")
+                    replies.append(f"  일정 삭제 중 오류가 발생했어요.\n\n  사유: {ex.detail}")
                     actions.append({"ok": False, "error": "not_found"})
 
             if deleted_events_for_block:
                 block = _render_list_block(deleted_events_for_block, indices=deleted_indices_for_block)
-                replies.append("🗑️ 다음 일정을 삭제했어요:\n" + ZERO + "\n" + block)
+                replies.append("    🗑️ 다음 일정을 삭제했어요.\n\n" + _indent_block(block, 1))
             if deleted_fallback_lines:
-                replies.append("🗑️ 다음 항목은 스냅샷이 없어 간략히 표시했어요:\n" + "\n".join(deleted_fallback_lines))
+                replies.append("    🗑️ 스냅샷이 없어 간략히 표시한 항목:\n\n" + _indent_block("\n".join(deleted_fallback_lines), 1))
             continue
 
-        # 상세 by 인덱스
+        # ---------------- 상세(인덱스) ----------------
         if name == "get_event_detail_by_index":
             idx = int(args["index"])
             pair = _map_index_to_pair(sid, idx)
             if not pair:
-                replies.append("해당 번호의 일정을 찾을 수 없어요.")
+                replies.append("  해당 번호의 일정을 찾을 수 없어요.\n\n  최근 조회 목록을 다시 띄워주세요.")
                 actions.append({"ok": False, "error": "index_out_of_range"})
                 continue
             event_id, cal_id = pair
             try:
                 e = gcal_get_event(sid, cal_id, event_id)
-                replies.append(_fmt_detail_g(e))
+                replies.append(_indent_block(_fmt_detail_g(e), 2))
                 actions.append({"detail": _pack_g(e)})
             except HTTPException:
-                replies.append("해당 일정을 찾지 못했어요.")
+                replies.append("  해당 일정을 찾지 못했어요.\n\n  이미 변경/삭제되었을 수 있어요.")
                 actions.append({"ok": False, "error": "not_found"})
             continue
 
-        # 상세 by 아이디/인덱스
+        # ---------------- 상세(아이디/인덱스) ----------------
         if name == "get_event_detail":
             event_id = None
             cal_id = None
@@ -780,20 +1010,20 @@ def chat(input: ChatIn):
                 cal_id = _find_cal_for_id(sid, event_id) or "primary"
 
             if not event_id:
-                replies.append("해당 일정을 찾지 못했어요.")
+                replies.append("  해당 일정을 찾지 못했어요.\n\n  목록에서 번호를 선택해 주세요.")
                 actions.append({"ok": False, "error": "not_found"})
                 continue
 
             try:
                 e = gcal_get_event(sid, cal_id, event_id)
-                replies.append(_fmt_detail_g(e))
+                replies.append(_indent_block(_fmt_detail_g(e), 2))
                 actions.append({"detail": _pack_g(e)})
             except HTTPException:
-                replies.append("해당 일정을 찾지 못했어요.")
+                replies.append("  해당 일정을 찾지 못했어요.\n\n  이미 변경/삭제되었을 수 있어요.")
                 actions.append({"ok": False, "error": "not_found"})
             continue
 
-        # 편집 시작
+        # ---------------- 편집 시작 ----------------
         if name == "start_edit":
             event_id = None
             cal_id = None
@@ -806,28 +1036,42 @@ def chat(input: ChatIn):
                 cal_id = _find_cal_for_id(sid, event_id)
 
             if not event_id:
-                replies.append("대상을 찾을 수 없어요. 먼저 '전체 일정 보여줘'로 목록을 띄워주세요.")
+                replies.append("  대상을 찾을 수 없어요.\n\n  먼저 '일정 목록'을 띄워주세요.")
                 actions.append({"ok": False, "error": "not_found"})
             else:
                 try:
                     e = gcal_get_event(sid, cal_id or "primary", event_id)
                     replies.append(
-                        "수정할 항목을 알려주세요. (제목/시간/설명/위치/참석자)\n"
-                        "(참석자는 이메일 주소로 입력해주세요)\n\n" + _fmt_detail_g(e)
+                        "    수정할 항목을 알려주세요.\n\n"
+                        "    1. 제목\n"
+                        "    2. 시간(시작/종료)\n"
+                        "    3. 설명\n"
+                        "    4. 위치\n"
+                        "    5. 참석자(이메일)\n\n"
+                        + _indent_block(_fmt_detail_g(e), 2)
                     )
                     actions.append({"detail": _pack_g(e)})
                 except HTTPException:
-                    replies.append("대상을 찾을 수 없어요.")
+                    replies.append("  대상을 찾을 수 없어요.\n\n  이미 변경/삭제되었을 수 있어요.")
                     actions.append({"ok": False, "error": "not_found"})
             continue
 
-    # After any mutation, refresh the latest snapshot list so follow-up indexes reflect the new state.
+    # 여러 개 생성/수정 결과를 번호 매겨 요약 표시 (항상 별도 문단으로 분리)
+    if created_events_agg:
+        block = _render_list_block(created_events_agg)
+        replies.append(INDENT_SECTION + "✅ 일정이 생성되었어요.\n\n" + _indent_block(block, 1))
+
+    if updated_events_agg:
+        block = _render_list_block(updated_events_agg)
+        replies.append(INDENT_SECTION + "🔧 다음 일정을 수정했어요.\n\n" + _indent_block(block, 1))
+
+    # 변경이 있었다면 최신 스냅샷 갱신 및 최신 목록 노출(번호/문단 분리/추가 들여쓰기)
     if did_mutation:
-        items = gcal_list_events_all(sid, None, None, None)
+        items = gcal_list_events_all(sid, None, None, None, False, False)
         SESSION_LAST_LIST[sid] = [(it.get("id"), it.get("_calendarId") or "primary") for it in items]
         SESSION_LAST_ITEMS[sid] = items
         block = _render_list_block(items)
-        replies.append("\n변경 후 최신 목록입니다:\n" + ZERO + "\n" + (block if block else "남아있는 일정이 없어요."))
+        replies.append(INDENT_SECTION + "변경 이후 최신 목록입니다.\n\n" + _indent_block(block, 2))
         actions.append({"list": [{"idx": i + 1, **_pack_g(e)} for i, e in enumerate(items)]})
 
     reply = "\n\n".join(replies) if replies else "완료했습니다."
