@@ -79,7 +79,10 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "create_event",
-            "description": "Create a Google Calendar event. If attendees are provided and user didn't specify email sending, ask first.",
+            "description": (
+                "Create a Google Calendar event. If attendees are provided and user didn't specify email sending, ask first.\n"
+                "Use KST. If end is omitted or <= start, treat as start+1h."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -91,7 +94,7 @@ TOOLS_SPEC = [
                     "attendees": {"type": "array", "items": {"type": "string"}},
                     "notify_attendees": {
                         "type": "boolean",
-                        "description": "true면 참석자 초대메일 발송, false면 발송 안함"
+                        "description": "true면 참석자 초대메일 발송, false면 발송 안함",
                     },
                     "session_id": {"type": "string"},
                 },
@@ -104,7 +107,13 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "list_events",
-            "description": "List events (defaults today..end of year KST). Do NOT include holidays/birthdays unless the user asks.",
+            "description": (
+                "List events in the user's calendars.\n"
+                "-> Use this to implement natural-language filters like '오늘', '이번달', '이번 주', '내일', 특정 제목 키워드 등.\n"
+                "-> Fill 'from' and 'to' as ISO 8601 (KST). Examples of mapping: 오늘=[오늘 00:00, 내일 00:00), 이번달=[이달 1일 00:00, 다음달 1일 00:00).\n"
+                "-> For title/keyword filters, set 'query' to the phrase (e.g., '약먹어', '회의').\n"
+                "Do NOT include holidays/birthdays unless the user asks."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -123,7 +132,10 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "update_event",
-            "description": "Update a Google Calendar event. Pass id or last-list 1-based index. When modifying attendees and user didn't specify email sending, ask first.",
+            "description": (
+                "Update a Google Calendar event. Pass id or last-list 1-based index.\n"
+                "When modifying attendees and user didn't specify email sending, ask first."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -143,7 +155,7 @@ TOOLS_SPEC = [
                     },
                     "notify_attendees": {
                         "type": "boolean",
-                        "description": "true면 참석자 초대메일 발송, false면 발송 안함"
+                        "description": "true면 참석자 초대메일 발송, false면 발송 안함",
                     },
                     "session_id": {"type": "string"},
                 },
@@ -156,7 +168,10 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "delete_event",
-            "description": "Delete events. Use exactly one of: indexes, index, ids, id.",
+            "description": (
+                "Delete events. Use exactly one of: indexes, index, ids, id.\n"
+                "For natural-language like '오늘 약먹어 일정 삭제', first call list_events with from/to+query, then call delete_event with resulting indexes."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -174,7 +189,10 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "get_event_detail",
-            "description": "Get detail by id or 1-based index.",
+            "description": (
+                "Get event detail by id or 1-based index from the last list.\n"
+                "Use this after filtering (e.g., when user asks '~~일정 참석자 알려줘')."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -245,6 +263,8 @@ def _openai_chat(messages):
         raise HTTPException(500, "LLM call failed")
     return r.json()
 
+# ---- Time helpers ----
+
 def _get_kst(dt_str: Optional[str]):
     if not dt_str:
         return None
@@ -261,6 +281,8 @@ def _fmt_kst_time(dt: Optional[datetime]) -> str:
     if not dt:
         return "없음"
     return dt.strftime("%H:%M")
+
+# ---- Render helpers ----
 
 def _line_required_g(e: dict) -> str:
     title = e.get("summary") or "(제목 없음)"
@@ -307,6 +329,8 @@ def _pack_g(e: dict) -> dict:
         ],
     }
 
+# Snapshot helpers
+
 def _find_snapshot_item(sid: str, event_id: str, cal_id: str) -> Optional[Dict[str, Any]]:
     items = SESSION_LAST_ITEMS.get(sid) or []
     for e in items:
@@ -315,6 +339,7 @@ def _find_snapshot_item(sid: str, event_id: str, cal_id: str) -> Optional[Dict[s
     return None
 
 # 시간 파싱 유틸
+
 def _parse_dt(dt_str: Optional[str]) -> Optional[datetime]:
     if not dt_str:
         return None
@@ -333,38 +358,51 @@ def _parse_dt(dt_str: Optional[str]) -> Optional[datetime]:
 def _rfc3339(dt: datetime) -> str:
     return dt.astimezone(KST).isoformat()
 
-# 시스템 정책
+# ---------------- System policy for the LLM ----------------
 SYSTEM_POLICY_TEMPLATE = """
 You are ScheduleBot. Google Calendar 연결 사용자의 일정만 처리합니다.
 - Respond in Korean.
 - 시간대는 Asia/Seoul (KST). ISO 8601 사용.
 
-[생성 흐름]
-- 사용자가 생성 의도를 보이면, 첫 응답은 반드시 아래 형식의 안내 블록으로 시작해야 합니다.
-  (문구는 자연스럽게 표현해도 되지만, **필수/선택 구분과 항목 이름은 모두 포함**)
+[핵심 원칙]
+- 사용자의 자연어를 스스로 해석해 필요한 도구 호출을 **연쇄적으로** 수행합니다.
+- 서버 측 키워드 매칭은 사용하지 않습니다. (LLM이 판단)
+- 가능하면 재질문하지 말고, 합리적으로 가정하여 진행하세요.
+- 참석자가 1명 이상인 생성/수정 작업은 확정 후 한 번만 초대 메일 여부(예/아니오)를 물어봅니다.
+- **사용자에게 ISO 예시를 보여주지 마세요.** (도구 호출에만 사용)
 
-일정을 생성하기 위해 필요한 정보를 알려주세요. **필수 항목을 포함해서 자유롭게 작성해 주셔도 됩니다.**
-※ 종료 시간을 비우면 시작 시간 기준 **1시간 뒤**로 자동 설정합니다.
+[의도 판별]
+- 생성 / 목록 / 상세 / 참석자 조회 / 수정 / 삭제.
+- "~일정 참석자 알려줘" ⇒ 필터링해서 단일 후보면 상세 조회(get_event_detail)로 참석자까지 보여주기.
+- "오늘/이번달/이번 주/내일/어제" 등 기간 지시어와 제목/키워드(예: "약먹어")를 함께 해석.
 
-- [필수] 제목
-- [필수] 시작 시간
-- [선택] 종료 시간 (미입력 시 시작+1시간)
-- [선택] 설명
-- [선택] 위치
-- [선택] 참석자 이메일 (쉼표로 여러 명 가능)
+[자연어 기간 → from/to (모두 KST, ISO 8601)]
+- 오늘: [오늘 00:00, 내일 00:00)
+- 내일: [내일 00:00, 모레 00:00)
+- 어제: [어제 00:00, 오늘 00:00)
+- 이번 주: [이번 주 월요일 00:00, 다음 주 월요일 00:00)  ※ 주 시작은 월요일
+- 다음 주: [다음 주 월요일 00:00, 다다음 주 월요일 00:00)
+- 이번달: [이번달 1일 00:00, 다음달 1일 00:00)
+- 다음달: [다음달 1일 00:00, 다다음달 1일 00:00)
 
-- 위 안내 블록은 **첫 질문에서만** 보여줍니다.
-- 선택 항목(설명/위치/참석자/종료)이 비었더라도 재질문으로 강요하지 말고, 가능한 값으로 가정하여 **확인 단계**로 진행하세요.
-- 참석자가 1명 이상인 경우, 생성/수정이 ‘예’로 확정된 다음 **별도 질문**으로 “초대 메일을 보낼까요? (예/아니오)”를 한 번만 물어보세요.
-- **사용자에게 ISO 형식(예: 2025-08-21T10:00) 예시는 절대 보여주지 마세요.**
+[도구 사용 지침]
+- 목록(list_events): 위 기간 규칙에 따라 from/to를 채우고, 제목/키워드는 query에 입력. 공휴일/생일은 요청 있을 때만 포함.
+- 삭제(delete_event): 자연어로 범위+키워드가 오면 (1) list_events로 필터링 → (2) 결과 인덱스로 delete_event 호출. 결과가 0개면 친절히 안내.
+- 참석자 요청: (1) list_events로 필터링 → 후보가 1개면 get_event_detail, 여러 개면 번호 선택 유도.
+- 생성(create_event): 종료 누락 또는 종료<=시작이면 시작+1시간으로 도구 호출.
+- 수정(update_event): start만 변경이고 end가 없거나 start>=end면 start+1시간으로 보정.
 
-[수정 흐름]
-- 수정도 동일한 '요약 → (예/아니오) 확인' 플로우를 사용합니다.
-- 참석자 변경이 있을 때만, 수정 확정 후 별도의 한 질문으로 초대 메일 여부를 묻습니다.
-  (기존 참석자에게는 다시 보내지 않고, **새로 추가된 이메일에만** 보내야 함을 명확히 알립니다.)
+[샘플 시나리오 (도구 호출 예)]
+1) "오늘 약먹어 일정 삭제해줘"
+   - list_events {from=오늘 00:00, to=내일 00:00, query="약먹어"}
+   - delete_event {indexes=[1,2,...]}  (목록 결과 기준)
 
-[목록]
-- 기본 ‘전체 일정’은 공휴일/생일을 포함하지 않습니다. 사용자가 명시하면 포함합니다.
+2) "이번달 일정 알려줘"
+   - list_events {from=이번달 1일 00:00, to=다음달 1일 00:00}
+
+3) "프로젝트 킥오프 일정 참석자 알려줘"
+   - list_events {query="프로젝트 킥오프"}
+   - (후보 1개면) get_event_detail {index=1}
 
 현재 시각(KST): {NOW_ISO}, Today: {TODAY_FRIENDLY}.
 """
@@ -431,6 +469,8 @@ class ChatOut(BaseModel):
     reply: str
     tool_result: Optional[Any] = None
 
+# Snapshot mapping helpers
+
 def _map_index_to_pair(sid: str, idx: int) -> Optional[Tuple[str, str]]:
     pairs = SESSION_LAST_LIST.get(sid) or []
     if 1 <= idx <= len(pairs):
@@ -451,8 +491,10 @@ def chat(input: ChatIn):
     sid = (input.session_id or "").strip()
     _must_google_connected(sid)
 
-    system_prompt = SYSTEM_POLICY_TEMPLATE.format(
-        NOW_ISO=_now_kst_iso(), TODAY_FRIENDLY=_friendly_today()
+    system_prompt = (
+        SYSTEM_POLICY_TEMPLATE
+        .replace("{NOW_ISO}", _now_kst_iso())
+        .replace("{TODAY_FRIENDLY}", _friendly_today())
     )
     msgs = [{"role": "system", "content": system_prompt}]
     if input.history:
@@ -492,7 +534,7 @@ def chat(input: ChatIn):
             SESSION_LAST_ITEMS[sid] = items
 
             if not items:
-                replies.append("일정이 없어요.")
+                replies.append("해당 조건에 맞는 일정이 없어요.")
                 actions.append({"list": []})
             elif len(items) == 1:
                 e = items[0]
@@ -577,25 +619,28 @@ def chat(input: ChatIn):
 
             p = args.get("patch") or {}
             body: Dict[str, Any] = {}
-            if "title" in p: body["summary"] = p["title"]
+            if "title" in p:
+                body["summary"] = p["title"]
 
             new_start_dt = _parse_dt(p.get("start"))
-            new_end_dt   = _parse_dt(p.get("end"))
+            new_end_dt = _parse_dt(p.get("end"))
 
             if new_start_dt:
                 body.setdefault("start", {})["dateTime"] = _rfc3339(new_start_dt)
             if new_end_dt:
                 body.setdefault("end", {})["dateTime"] = _rfc3339(new_end_dt)
 
-            # ✅ start만 바뀌고 end가 없거나 start>=end면 start+1h로 보정
+            # start만 바뀌고 end가 없거나 start>=end면 start+1h로 보정
             if new_start_dt and (not new_end_dt):
                 cur = gcal_get_event(sid, cal_id or "primary", event_id)
                 cur_end_dt = _parse_dt(cur.get("end", {}).get("dateTime") or cur.get("end", {}).get("date"))
                 if (cur_end_dt is None) or (cur_end_dt <= new_start_dt):
                     body.setdefault("end", {})["dateTime"] = _rfc3339(new_start_dt + timedelta(hours=1))
 
-            if "description" in p: body["description"] = p["description"]
-            if "location"    in p: body["location"]    = p["location"]
+            if "description" in p:
+                body["description"] = p["description"]
+            if "location" in p:
+                body["location"] = p["location"]
 
             send_updates = None
             if "attendees" in p:
@@ -615,8 +660,7 @@ def chat(input: ChatIn):
 
             try:
                 e = gcal_patch_event(
-                    sid, event_id, body, cal_id or "primary",
-                    send_updates=send_updates
+                    sid, event_id, body, cal_id or "primary", send_updates=send_updates
                 )
                 replies.append("🔧 일정 수정 완료:\n" + _fmt_detail_g(e))
                 actions.append({"updated": _pack_g(e)})
@@ -639,18 +683,22 @@ def chat(input: ChatIn):
             if args.get("indexes"):
                 for i in args["indexes"]:
                     p = idx_to_pair_local(int(i))
-                    if p: targets.append(p)
+                    if p:
+                        targets.append(p)
             elif args.get("index"):
                 p = idx_to_pair_local(int(args["index"]))
-                if p: targets.append(p)
+                if p:
+                    targets.append(p)
             elif args.get("ids"):
                 for eid in args["ids"]:
                     cal = _find_cal_for_id(sid, str(eid))
-                    if cal: targets.append((str(eid), cal))
+                    if cal:
+                        targets.append((str(eid), cal))
             elif args.get("id"):
                 eid = str(args["id"])
                 cal = _find_cal_for_id(sid, eid)
-                if cal: targets.append((eid, cal))
+                if cal:
+                    targets.append((eid, cal))
             else:
                 replies.append("삭제할 일정을 찾지 못했어요.")
                 actions.append({"ok": False, "error": "not_found"})
@@ -725,7 +773,8 @@ def chat(input: ChatIn):
             cal_id = None
             if "index" in args and args["index"]:
                 pair = _map_index_to_pair(sid, int(args["index"]))
-                if pair: event_id, cal_id = pair
+                if pair:
+                    event_id, cal_id = pair
             if not event_id and args.get("id"):
                 event_id = str(args["id"])
                 cal_id = _find_cal_for_id(sid, event_id) or "primary"
@@ -750,7 +799,8 @@ def chat(input: ChatIn):
             cal_id = None
             if args.get("index"):
                 pair = _map_index_to_pair(sid, int(args["index"]))
-                if pair: event_id, cal_id = pair
+                if pair:
+                    event_id, cal_id = pair
             elif args.get("id"):
                 event_id = str(args["id"])
                 cal_id = _find_cal_for_id(sid, event_id)
@@ -771,6 +821,7 @@ def chat(input: ChatIn):
                     actions.append({"ok": False, "error": "not_found"})
             continue
 
+    # After any mutation, refresh the latest snapshot list so follow-up indexes reflect the new state.
     if did_mutation:
         items = gcal_list_events_all(sid, None, None, None)
         SESSION_LAST_LIST[sid] = [(it.get("id"), it.get("_calendarId") or "primary") for it in items]
