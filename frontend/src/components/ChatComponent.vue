@@ -19,6 +19,7 @@
                 >
                     <div
                         v-if="msg.role === 'assistant'"
+                        class="assistant-content"
                         v-html="renderMarkdown(msg.content)"
                     />
                     <div v-else class="whitespace-pre-line">
@@ -146,3 +147,21 @@ export default defineComponent({
     },
 });
 </script>
+
+<style scoped>
+:deep(.assistant-content ol) {
+    list-style: decimal;
+    list-style-position: inside;
+    margin: 0.25rem 0;
+    padding-left: 0;
+}
+:deep(.assistant-content ul) {
+    list-style: disc;
+    list-style-position: inside;
+    margin: 0.25rem 0;
+    padding-left: 0;
+}
+:deep(.assistant-content li) {
+    margin: 0.125rem 0;
+}
+</style>
