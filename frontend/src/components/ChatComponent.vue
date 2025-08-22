@@ -85,6 +85,7 @@ export default defineComponent({
             const html = md.render(text ?? "");
             return DOMPurify.sanitize(html);
         },
+
         autoResize() {
             const textarea = this.$refs.inputBox as
                 | HTMLTextAreaElement
