@@ -27,6 +27,21 @@
                     </div>
                 </div>
             </div>
+
+            <div v-if="isSending" class="flex justify-start">
+                <div
+                    class="rounded-lg px-4 py-2 max-w-md bg-white border border-gray-300 text-gray-800"
+                >
+                    <!-- <span class="sr-only">답변 생성 중…</span> -->
+                    <div
+                        class="w-full h-full px-4 py-2 typing flex justify-center items-center gap-1.5"
+                    >
+                        <span class="typing-dot"></span>
+                        <span class="typing-dot"></span>
+                        <span class="typing-dot"></span>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <div class="border-t border-gray-200 p-4 bg-white">
@@ -46,10 +61,31 @@
 
                 <button
                     type="submit"
-                    class="px-4 py-2 bg-[#646CFF] text-white rounded-md hover:bg-blue-600 disabled:opacity-50"
+                    class="px-4 py-2 bg-[#646CFF] text-white rounded-md hover:bg-blue-600 disabled:opacity-50 flex items-center justify-center min-w-20"
                     :disabled="isSending || !userInput.trim()"
                 >
-                    전송
+                    <svg
+                        v-if="isSending"
+                        class="h-5 w-5 animate-spin"
+                        viewBox="0 0 24 24"
+                        aria-hidden="true"
+                    >
+                        <circle
+                            class="opacity-25"
+                            cx="12"
+                            cy="12"
+                            r="10"
+                            stroke="currentColor"
+                            stroke-width="4"
+                            fill="none"
+                        />
+                        <path
+                            class="opacity-75"
+                            fill="currentColor"
+                            d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"
+                        />
+                    </svg>
+                    <span v-else>전송</span>
                 </button>
             </form>
         </div>
@@ -75,7 +111,15 @@ export default defineComponent({
     data() {
         return {
             userInput: "" as string,
-            messages: [] as ChatMsg[],
+            messages: [
+                {
+                    role: "assistant",
+                    content: `안녕하세요! 저는 **일정 도우미 봇**입니다.
+                        \n **일정** 관련 답변만 가능합니다!
+                        \n **조회, 추가, 수정, 삭제 기능**을 지원합니다.
+                        \n 자세한 이름/기간 등으로 요청하시면 더 정확하게 대답합니다!`,
+                },
+            ] as ChatMsg[],
             isSending: false,
             isComposing: false,
         };
@@ -85,7 +129,6 @@ export default defineComponent({
             const html = md.render(text ?? "");
             return DOMPurify.sanitize(html);
         },
-
         autoResize() {
             const textarea = this.$refs.inputBox as
                 | HTMLTextAreaElement
@@ -104,7 +147,6 @@ export default defineComponent({
             if (!content) return;
 
             this.isSending = true;
-
             this.messages.push({ role: "user", content });
             this.userInput = "";
 
@@ -164,5 +206,33 @@ export default defineComponent({
 }
 :deep(.assistant-content li) {
     margin: 0.125rem 0;
+}
+
+.typing-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 9999px;
+    display: inline-block;
+    background: #646cff;
+    animation: typing-bounce 1.2s infinite ease-in-out both;
+}
+.typing-dot:nth-child(2) {
+    animation-delay: 0.15s;
+}
+.typing-dot:nth-child(3) {
+    animation-delay: 0.3s;
+}
+
+@keyframes typing-bounce {
+    0%,
+    80%,
+    100% {
+        opacity: 0.25;
+        transform: translateY(0);
+    }
+    40% {
+        opacity: 1;
+        transform: translateY(-3px);
+    }
 }
 </style>
