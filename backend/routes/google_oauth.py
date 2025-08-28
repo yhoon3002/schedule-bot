@@ -1,3 +1,4 @@
+# routes/google_oauth.py
 import os, time, logging, requests
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
@@ -14,7 +15,7 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 logger.info("[GoogleOAuth] BACKEND CLIENT_ID=%s****** (loaded=%s)",
             GOOGLE_CLIENT_ID[:6], bool(GOOGLE_CLIENT_ID))
 
-TOKENS = {}
+TOKENS = {} # 세션ID -> 토큰/프로필 메모리 저장소(프로덕션에선 외부 스토리지 권장)
 
 class CodeIn(BaseModel):
     code: str
@@ -22,6 +23,18 @@ class CodeIn(BaseModel):
     session_id: str
 
 def _exchange_code(code: str, redirect_uri: str):
+    """
+    OAuth 인가 코드를 토큰으로 교환한다.
+
+    :param code: Google OAuth 인가 코드
+    :type code: str
+    :param redirect_uri: OAuth 플로우의 리다이렉트 URI
+    :type redirect_uri: str
+    :return: 토큰 페이로드(access_token, refresh_token, scope, expires_in)
+    :rtype: Dict[str, Any]
+    :raises HTTPException: 400 - 교환 실패 / 500 - 환경변수 누락
+    """
+
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
         raise HTTPException(500, "GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET not set")
     r = requests.post(
@@ -42,6 +55,15 @@ def _exchange_code(code: str, redirect_uri: str):
     return r.json()
 
 def _userinfo(access_token: str):
+    """
+    OpenID Connect userinfo 엔드포인트로 사용자 프로필을 조회한다.
+
+    :param access_token: 유효한 액세스 토큰
+    :type access_token: str
+    :return: 사용자 프로필 딕셔너리(실패 시 빈 dict)
+    :rtype: Dict[str, Any]
+    """
+
     r = requests.get(
         "https://openidconnect.googleapis.com/v1/userinfo",
         headers={"Authorization": f"Bearer {access_token}"},
@@ -50,6 +72,16 @@ def _userinfo(access_token: str):
     return r.json() if r.ok else {}
 
 def _refresh(session_id: str):
+    """
+    세션의 액세스 토큰을 확인하고 만료 시 리프레시한다.
+
+    :param session_id: 세션 식별자
+    :type session_id: str
+    :return: (access_token, expires_at, scope 등)을 포함한 토큰 딕셔너리
+    :rtype: Dict[str, Any]
+    :raises HTTPException: 401 - 미연결/리프레시 실패
+    """
+
     tok = TOKENS.get(session_id)
     if not tok:
         logger.info("[_refresh] sid=%s | no token", session_id)
@@ -62,14 +94,16 @@ def _refresh(session_id: str):
                 session_id, int(tok.get("expires_at", 0) - time.time()),
                 bool(tok.get("refresh_token")))
 
-    # 아직 유효하면 그대로 사용
+    # 아직 유효하면 그대로 반환
     if tok.get("access_token") and exp - 60 > now:
         return tok
 
+    # refresh_token이 없으면 갱신 불가
     if not has_rt:
         logger.info("[_refresh] sid=%s | token expired and no refresh_token", session_id)
         raise HTTPException(401, "not connected")
 
+    # 토큰 갱긴
     r = requests.post(
         "https://oauth2.googleapis.com/token",
         data={
@@ -92,6 +126,15 @@ def _refresh(session_id: str):
 
 @router.get("/status")
 def status(session_id: str = Query(...)):
+    """
+    구글 캘린더 연결 여부와 프로필 메타데이터를 반환한다.
+
+    :param session_id: 세션 식별자
+    :type session_id: str
+    :return: {'connected', 'email', 'profile', 'scope'}
+    :rtype: Dict[str, Any]
+    """
+
     tok = TOKENS.get(session_id)
     scope = tok.get("scope") if tok else ""
     connected = bool(tok and "https://www.googleapis.com/auth/calendar" in (scope or ""))
@@ -109,6 +152,15 @@ def status(session_id: str = Query(...)):
 
 @router.post("/login")
 def login(body: CodeIn):
+    """
+    최초 로그인: 코드 교환 -> userinfo 조회 -> TOKENS 저장
+
+    :param body: code, redirect_uri, session_id를 포함
+    :type body: CodeIn
+    :return: {name, email, avatarUrl}
+    :rtype: Dict[str, Optional[str]]
+    """
+
     data = _exchange_code(body.code, body.redirect_uri)
     access = data["access_token"]
     profile = _userinfo(access)
@@ -126,6 +178,15 @@ def login(body: CodeIn):
 
 @router.post("/connect")
 def connect(body: CodeIn):
+    """
+    기존 세션에 스코프를 확장/연결한다. (토큰 저장/갱신)
+
+    :param body: code, redirect_uri, session_id를 포함
+    :type body: CodeIn
+    :return: {'connected': True, 'email': ...}
+    :rtype: Dict[str, Any]
+    """
+
     data = _exchange_code(body.code, body.redirect_uri)
     access = data["access_token"]
     tok = TOKENS.get(body.session_id, {})
@@ -145,6 +206,15 @@ def connect(body: CodeIn):
 
 @router.post("/disconnect")
 def disconnect(session_id: str = Query(...)):
+    """
+    현재 액세스 토큰을 revoke하고 세션 토큰 저장소를 비운다.
+
+    :param session_id: 세션 식별자
+    :type session_id: str
+    :return: {'ok': True}
+    :rtype: Dict[str, bool]
+    """
+
     tok = TOKENS.get(session_id)
     if tok and tok.get("access_token"):
         try:
