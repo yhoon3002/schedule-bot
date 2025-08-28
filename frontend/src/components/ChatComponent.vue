@@ -32,7 +32,6 @@
                 <div
                     class="rounded-lg px-4 py-2 max-w-md bg-white border border-gray-300 text-gray-800"
                 >
-                    <!-- <span class="sr-only">답변 생성 중…</span> -->
                     <div
                         class="w-full h-full px-4 py-2 typing flex justify-center items-center gap-1.5"
                     >
