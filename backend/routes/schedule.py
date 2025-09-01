@@ -1,4 +1,5 @@
 # routes/schedule.py
+# 일정(스케줄) 관련 라우터. LLM이 도구(tool)를 호출하면 여기의 핸들러들이 실제 Google Calendar API 호출을 수행함.
 import logging
 from datetime import timedelta
 from typing import Optional, Dict, Any, List, Tuple
@@ -20,7 +21,6 @@ from routes.schedule_utils import _split_valid_invalid_attendees
 from routes.schedule_time import (
     _parse_dt,
     _rfc3339,
-    _sanitize_llm_reply_text,
     _now_kst_iso,
     _friendly_today,
 )
@@ -28,8 +28,6 @@ from routes.schedule_render import _pack_g
 from routes.schedule_filters import _apply_filters, _resolve_where
 from routes.schedule_state import (
     refresh_session_cache,
-    get_cached_events,
-    invalidate_session_cache,
     _find_snapshot_item,
     _map_index_to_pair,
     _find_cal_for_id,
@@ -39,29 +37,45 @@ from routes.schedule_state import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/schedules", tags=["schedules"])
+# Google Calendar 권한 범위. 사용자가 이 스코프로 로그인되어 있어야 함.
 CAL_SCOPE = "https://www.googleapis.com/auth/calendar"
 
-# 세션별 캐시
-SESSION_PENDING_DELETE: Dict[str, List[Tuple[str, str]]] = {}
-SESSION_PENDING_UPDATE_NOTIFY: Dict[str, Dict[str, Any]] = {}
-SESSION_PENDING_CREATE: Dict[str, Dict[str, Any]] = {}
+# 세션 단위 캐시(메모리 저장소)
+# - LLM이 '미리보기 -> 확인(confirmed) -> 실행' 흐름을 쓰기에, 확인 대기 상태를 세션 별로 잠시 저장해 둠.
+SESSION_PENDING_DELETE: Dict[str, List[Tuple[str, str]]] = {}   # 삭제 후보 목록
+SESSION_PENDING_UPDATE_NOTIFY: Dict[str, Dict[str, Any]] = {}   # 업데이트(알림 선택 대기)
+SESSION_PENDING_CREATE: Dict[str, Dict[str, Any]] = {}  # 생성(미리보기/알림 선택 대기)
 
 
-# IO 모델
+# IO 모델(요청/응답 스키마)
 class ChatIn(BaseModel):
+    """
+    /schedules/chat 엔드포인트 입력 스키마
+    """
     user_message: str
     history: Optional[list] = None
     session_id: Optional[str] = None
 
 
 class ChatOut(BaseModel):
+    """
+    /schedules/chat 엔드포인트 출력 스키마
+    """
     model_config = ConfigDict(arbitrary_types_allowed=True)
     reply: str
     tool_result: Optional[Any] = None
 
 
-# 헬퍼 함수들
+# 헬퍼
 def _must_google_connected(session_id: str):
+    """
+    현재 세션이 Google Calendar 권한으로 연결되어 있는지 확인함.
+    연결되어 있지 않으면 401 에러 발생.
+
+    :param session_id: 세션 ID(토큰 조회 키)
+    :type session_id: str
+    :raises HTTPException: 캘린더 권한이 없으면 401
+    """
     tok = TOKENS.get(session_id or "")
     scope = (tok.get("scope") if tok else "") or ""
     if not (tok and CAL_SCOPE in scope):
@@ -69,6 +83,14 @@ def _must_google_connected(session_id: str):
 
 
 def _dedupe_emails(emails: Optional[List[str]]) -> List[str]:
+    """
+    이메일 목록에서 중복/공백을 제거하고 소문자로 정규화함.
+
+    :param emails: 이메일 문자열 리스트(또는 None)
+    :type emails: Optional[List[str]]
+    :return: 중복 제거된 이메일 리스트
+    :rtype: List[str]
+    """
     out: List[str] = []
     seen: set = set()
     for e in emails or []:
@@ -80,10 +102,27 @@ def _dedupe_emails(emails: Optional[List[str]]) -> List[str]:
 
 
 def create_tool_handler(sid: str):
-    """세션별 도구 핸들러 생성"""
+    """
+    세션별 도구 핸들러 팩토리.
+    LLM이 호출하는 function tool 이름에 따라 해당 핸들러로 라우팅함.
+
+    :param sid: 세션 ID
+    :type sid: str
+    :return: (function_name, args) -> result(dict) 형태의 Callable
+    :rtype: callable
+    """
 
     def handle_tool(function_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        """통합 도구 핸들러"""
+        """
+        LLM의 개별 도구 호출을 실제 핸들러로 연결함
+
+        :param function_name: 도구(함수) 이름 (예: "create_event")
+        :type function_name: str
+        :param args: 도구 인수(JSON)
+        :type args: Dict[str, Any]
+        :return: 실행 결과(보통 {"actions": [...]} 형태
+        :rtype: Dict[str, Any]
+        """
         try:
             if function_name == "list_events":
                 return handle_list_events(sid, args)
@@ -108,9 +147,22 @@ def create_tool_handler(sid: str):
 
     return handle_tool
 
-
+# 개별 도구 핸들러들(LLM아 호출함)
 def handle_list_events(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    """일정 목록 조회 핸들러"""
+    """
+    일정 목록 조회
+    1. 구글 캘린더에서 범위/검색어 기준으로 일정 가져오기
+    2. 후처리 필터(_apply_filters) 적용
+    3. 최신 결과를 세션 캐시에 저장(목록/아이템)
+    4. LLM이 읽기 좋은 형태로 포장(_pack_g) 후 반환
+
+    :param sid: 세션 ID
+    :type sid: str
+    :param args: from/to/query/filters/include_holidays/include_birthdays 등 검색 인자
+    :type args: Dict[str, Any]
+    :return: {"actions": [{"list": [...]}]}
+    :rtype: Dict[str, Any]
+    """
     items = gcal_list_events_all(
         sid,
         args.get("from"),
@@ -121,7 +173,7 @@ def handle_list_events(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
     )
     filtered = _apply_filters(items, args.get("filters") or {})
 
-    # 캐시 업데이트
+    # 인덱스 선택 기능을 위해 최근 결과를 캐시에 저장
     SESSION_LAST_LIST[sid] = [(it.get("id"), it.get("_calendarId") or "primary") for it in filtered]
     SESSION_LAST_ITEMS[sid] = filtered
 
@@ -133,8 +185,21 @@ def handle_list_events(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_create_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    """일정 생성 핸들러"""
-    # 캐시된 미리보기에서 확정하는 경우
+    """
+    일정 생성
+
+    첫번째 호출(confirmed=False): '미리보기' 제공 + 세션캐시에 저장
+    두번째 호출(confirmed=True): '알림 여부' 결정 후 실제 생성
+
+    :param sid: 세션 ID
+    :type sid: str
+    :param args: title/start/end/description/location/attendees/confirmed/notify_attendees ... 등
+    :type args: Dict[str, Any]
+    :return: actions 배열(미리보기 or created 결과)
+    :rtype: Dict[str, Any]
+    """
+
+    # 1) (확정단계) 이전에 미리보기로 저장한 내용이 있으면 그것을 기반으로 생성
     pending_create = SESSION_PENDING_CREATE.get(sid)
     if args.get("confirmed", False) and pending_create:
         if pending_create.get("has_attendees") and args.get("notify_attendees") is None:

@@ -54,8 +54,10 @@ class MultiStepToolExecutor:
         4) 사용자 확인 필요(need_confirm 등) 시 그 지점에서 종료 & 요약 응답 생성
         5) 추가 확인이 없다면 다음 루프로 넘어가 연쇄 도구 호출을 이어감
 
-        Returns:
-            (final_reply, tool_result)
+        :param messages: LLM에 전달할 전체 대화 히스토리(시스템/유저/어시스턴트/툴 메시지)
+        :type messages: List[Dict[str, Any]]
+        :return: (사용자에게 보여줄 최종 응답 텍스트, 프론트엔드용 액션 리스트 등 부가 결과)
+        :rtype: Tuple[str, Optional[Any]]
         """
         self.conversation_history = messages.copy()
         iteration = 0
@@ -140,11 +142,18 @@ class MultiStepToolExecutor:
         return "작업이 복잡해서 완료하지 못했습니다. 단계별로 나누어 요청해 주세요.", None
 
     def _call_openai(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """OpenAI API 호출"""
+        """
+        OpenAI Chat Completions API를 호출하여 응답을 받아옴.
+
+        :param messages: LLM에 전달할 대화 히스토리(시스템/유저/어시스턴트/툴 메시지 포함)
+        :type messages: List[Dict[str, Any]]
+        :raises HTTPException: OPENAI_API_KEY 미설정 또는 API 호출 실패 시 500 에러
+        :return: OpenAI API의 원본 응답(JSON dict)
+        :rtype: Dict[str, Any]
+        """
         if not OPENAI_API_KEY:
             raise HTTPException(500, "OPENAI_API_KEY not set")
 
-        # 디버깅용 로깅
         try:
             last_user = next((m for m in messages[::-1] if m["role"] == "user"), {})
 
@@ -189,7 +198,14 @@ class MultiStepToolExecutor:
         return data
 
     def _execute_single_tool(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
-        """단일 도구 실행"""
+        """
+        모델이 요청한 단일 도구 호출을 실제로 실행함.
+
+        :param tool_call: 모델 응답의 tool_calls 중 하나(함수명/인자 포함)
+        :type tool_call: Dict[str, Any]
+        :return: 도구 실행 결과(dict 형식, 보통 {"actions": [...]} 형태)
+        :rtype: Dict[str, Any]
+        """
         try:
             function_name = tool_call["function"]["name"]
             raw_args = tool_call["function"].get("arguments", "{}")
@@ -219,14 +235,26 @@ class MultiStepToolExecutor:
             }
 
     def _collect_all_actions(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """모든 결과에서 액션들을 수집"""
+        """
+        여러 도구 실행 결과에서 actions를 전부 모아 하나의 리스트로 반환함.
+
+        :param results: 각 도구 실행 결과들의 리스트
+        :type results: List[Dict[str, Any]]
+        :return: 모든 결과에서 수집한 actions의 평탄화 리스트
+        :rtype: List[Dict[str, Any]]
+        """
         all_actions = []
         for result in results:
             all_actions.extend(result.get("actions", []))
         return all_actions
 
     def _generate_final_response(self) -> str:
-        """최종 응답 생성을 위해 한 번 더 OpenAI 호출"""
+        """
+        지금까지의 히스토리를 바탕으로 '친근하고 자연스러운 요약 멘트'를 생성함.
+
+        :return: 사용자에게 보여줄 최종 요약 텍스트
+        :rtype: str
+        """
         try:
             # 요약 요청 메시지 추가
             summary_messages = self.conversation_history.copy()
@@ -244,21 +272,29 @@ class MultiStepToolExecutor:
             return "작업이 완료되었습니다."
 
     def _sanitize_reply(self, text: str) -> str:
-        """응답 텍스트 정제"""
+        """
+        모델의 자연어 응답 텍스트를 간단히 정제함.
+
+        :param text: 원본 응답 테스트
+        :type text: str
+        :return: 앞뒤 공백 제거만 적용된 텍스트
+        :rtype: str
+        """
         return text.strip()
 
 
 def _openai_chat_multi_step(messages: List[Dict[str, Any]], session_id: str, tool_handler) -> Tuple[str, Optional[Any]]:
     """
-    다단계 도구 실행을 지원하는 OpenAI 채팅 인터페이스
+    다단계 도구 실행을 지원하는 외부용 래퍼 함수.
 
-    Args:
-        messages: 대화 히스토리
-        session_id: 세션 ID
-        tool_handler: 도구 실행 함수 (function_name, args) -> result
-
-    Returns:
-        (reply_text, tool_result)
+    :param messages: LLM에 전달할 대화 히스토리(시스템/유저/어시스턴트/툴 메시지 포함)
+    :type messages: List[Dict[str, any]]
+    :param session_id: 세션 식별자
+    :type session_id: str
+    :param tool_handler: 도구 실행 콜백 함수. (function_name, args) -> dict
+    :type tool_handler: Callable[[str, Dict[str, Any]], Dict[str, Any]]
+    :return: (최종 응답 텍스트, 프론트엔드용 액션 등 부가 결과)
+    :rtype: Tuple[str, Optional[Any]]
     """
     executor = MultiStepToolExecutor(session_id, tool_handler)
     return executor.execute_conversation(messages)
@@ -266,12 +302,19 @@ def _openai_chat_multi_step(messages: List[Dict[str, Any]], session_id: str, too
 
 def _openai_chat(messages):
     """
-    기존 단일 호출 방식 (호환성용)
+    단일 호출 방식
+
+    tool_choice='auto'로 한 번만 LLM을 호출하고, OpenAI의 원본 응답(JSON)을 그대로 반환함.
+
+    :param messages: LLM에 전달할 대화 히스토리
+    :type messages: List[Dict[str, Any]]
+    :raises HTTPException: OPENAI_API_KEY 미설정 또는 API 호출 실패 시 500 에러
+    :return: OpenAI API의 원본 응답(JSON Dict)
+    :rtype: Dict[str, Any]
     """
     if not OPENAI_API_KEY:
         raise HTTPException(500, "OPENAI_API_KEY not set")
 
-    # 입력 메시지 요약 로깅(앞부분만)
     try:
         import json as _json
         _first_user = next((m for m in messages[::-1] if m["role"] == "user"), {})
@@ -280,7 +323,6 @@ def _openai_chat(messages):
     except Exception:
         pass
 
-    # tool_choice='auto' -> 모델이 툴 호출 여부/순서를 스스로 결정
     r = requests.post(
         f"{OPENAI_BASE}/chat/completions",
         headers={
