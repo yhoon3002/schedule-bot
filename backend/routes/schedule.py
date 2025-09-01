@@ -1,4 +1,3 @@
-# routes/schedule.py
 # 일정(스케줄) 관련 라우터. LLM이 도구(tool)를 호출하면 여기의 핸들러들이 실제 Google Calendar API 호출을 수행함.
 import logging
 from datetime import timedelta
@@ -147,6 +146,7 @@ def create_tool_handler(sid: str):
 
     return handle_tool
 
+
 # 개별 도구 핸들러들(LLM아 호출함)
 def handle_list_events(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -226,7 +226,7 @@ def handle_create_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
         finally:
             SESSION_PENDING_CREATE.pop(sid, None)
 
-    # 새로운 일정 생성 요청 처리
+    # 2) (미리보기 단계) 새로 입력된 내용으로 유효성 검사
     attendees_input = args.get("attendees")
     valid_emails, invalids = _split_valid_invalid_attendees(attendees_input)
     if invalids:
@@ -241,8 +241,10 @@ def handle_create_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
     end_dt = _parse_dt(args.get("end"))
     if (end_dt is None) or (end_dt <= start_dt):
+        # 종료가 없거나 / 시작보다 빠르면 +1시간으로 보정함
         end_dt = start_dt + timedelta(hours=1)
 
+    # Google Calendar insert body 구성
     body = {
         "summary": args.get("title") or "(제목 없음)",
         "start": {"dateTime": _rfc3339(start_dt)},
@@ -257,7 +259,7 @@ def handle_create_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
     has_attendees = bool(valid_emails)
 
-    # 첫 번째 단계: 미리보기
+    # 2-1) 미리보기만 요청된 경우 -> 캐시에 저장 후 미리보기 반환
     if not args.get("confirmed", False):
         SESSION_PENDING_CREATE[sid] = {
             "body": body,
@@ -271,7 +273,7 @@ def handle_create_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
             }]
         }
 
-    # 확정이지만 참석자가 있고 메일 발송 여부가 미정인 경우
+    # 2-2) 확정인데 참석자 있고 알림 여부가 미정이면 알림 선택부터
     if has_attendees and args.get("notify_attendees") is None:
         SESSION_PENDING_CREATE[sid] = {
             "body": body,
@@ -285,7 +287,7 @@ def handle_create_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
             }]
         }
 
-    # 모든 정보가 준비된 경우 바로 생성
+    # 2-3) 모든 정보가 준비되면 즉시 생성
     send_updates = None
     if has_attendees:
         send_updates = "all" if args.get("notify_attendees") else "none"
@@ -299,11 +301,23 @@ def handle_create_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_update_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    """일정 수정 핸들러"""
+    """
+    일정 수정
+
+    - 첫 번째 호출(confirmed=False): 대상 탐색/미리보기/알림 선택 유도
+    - 두 번째 호출(confirmed=True): 실제 patch 수행
+
+    :param sid: 세션 ID
+    :type sid: str
+    :param args: id/index/where/patch/confirmed/notify_attendees emd
+    :type args: Dict[str, Any]
+    :return: actions 배열(need_confirm/need_index/updated 등)
+    :rtype: Dict[str, Any]
+    """
 
     logger.debug(f"[UPDATE] Called with args: {args}")
 
-    # 캐시된 미리보기에서 확정하는 경우
+    # 1) (확정단계) 이전에 저장된 알림 여부 대기가 있으면 그걸로 적용
     pending = SESSION_PENDING_UPDATE_NOTIFY.get(sid)
     if args.get("confirmed", False) and pending:
         if pending.get("has_new_attendees") and args.get("notify_attendees") is None:
@@ -342,7 +356,7 @@ def handle_update_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
         finally:
             SESSION_PENDING_UPDATE_NOTIFY.pop(sid, None)
 
-    # 이벤트 식별
+    # 2) 수정 대상 이벤트 식별(id/index/where 지원)
     event_id = None
     cal_id = None
 
@@ -354,6 +368,7 @@ def handle_update_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if not event_id and args.get("id"):
         raw_id = str(args.get("id")).strip()
         if raw_id.isdigit() and len(raw_id) < 6:
+            # 사용자가 인덱스를 id 필드로 준 경우(관용 처리)
             pair = _map_index_to_pair(sid, int(raw_id))
             if pair:
                 event_id, cal_id = pair
@@ -361,7 +376,7 @@ def handle_update_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
             event_id = raw_id
             cal_id = _find_cal_for_id(sid, event_id) or "primary"
 
-    # 패치 데이터 구성
+    # 2-1) patch 데이터 구성(부분 수정 허용)
     p = args.get("patch") or {}
     body_base: Dict[str, Any] = {}
     if "title" in p:
@@ -387,7 +402,7 @@ def handle_update_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
         valid_emails = _dedupe_emails(emails or [])
         body_base["attendees"] = [{"email": email} for email in valid_emails]
 
-    # where 조건으로 이벤트 찾기
+    # 2-2) where 조건으로 대상 찾기(모호하면 need_index로 분기)
     matched: List[dict] = []
     if not event_id and args.get("where"):
         matched = _resolve_where(sid, args.get("where") or {})
@@ -411,13 +426,14 @@ def handle_update_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if not event_id:
         return {"actions": [{"ok": False, "error": "not_found"}]}
 
-    # 기존 이벤트 정보 가져오기 및 새 참석자 여부 확인
+    # 2-3) 기존 스냅샷을 가져와 새 참석자 추가 여부 및 시간 보정 판단
     snapshot_before = None
     try:
         snapshot_before = gcal_get_event(sid, cal_id or "primary", event_id)
     except HTTPException:
         pass
 
+    # 참석자 비교 -> 새 참석자가 추가되었는지 판단(알림 필요 여부때문에)
     if valid_emails is not None and snapshot_before:
         before_emails = set([a.get("email", "").strip().lower()
                              for a in (snapshot_before.get("attendees") or [])])
@@ -425,7 +441,7 @@ def handle_update_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
         newly_added = after_emails - before_emails
         has_new_attendees = bool(newly_added)
 
-    # 시간 조정
+    # 시작만 바뀌고 종료가 비어있으면 기존 종료를 기준으로 최소 1시간으로 보정
     if new_start_dt and (not new_end_dt) and snapshot_before:
         cur_end_dt = _parse_dt(
             snapshot_before.get("end", {}).get("dateTime") or
@@ -434,7 +450,7 @@ def handle_update_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
         if (cur_end_dt is None) or (cur_end_dt <= new_start_dt):
             body_base.setdefault("end", {})["dateTime"] = _rfc3339(new_start_dt + timedelta(hours=1))
 
-    # 미리보기 단계
+    # 3) 미리보기 단계
     if not args.get("confirmed", False):
         SESSION_PENDING_UPDATE_NOTIFY[sid] = {
             "event_id": event_id,
@@ -451,7 +467,7 @@ def handle_update_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
             }]
         }
 
-    # 확정이지만 새 참석자가 있고 메일 발송 여부가 미정인 경우
+    # 4) 확정인데 새 참석자 + 알림 여부 미지정 -> 알림 선택 요청
     if has_new_attendees and args.get("notify_attendees") is None:
         SESSION_PENDING_UPDATE_NOTIFY[sid] = {
             "event_id": event_id,
@@ -471,11 +487,10 @@ def handle_update_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
             }]
         }
 
-    # 모든 정보가 준비된 경우 바로 업데이트
+    # 5) 모든 정보 준비되면 -> 즉시 patch
     send_updates = None
     if has_new_attendees:
         send_updates = "all" if args.get("notify_attendees") else "none"
-
     try:
         e = gcal_patch_event(sid, event_id, body_base, cal_id or "primary", send_updates=send_updates)
         refresh_session_cache(sid)  # 캐시 새로고침
@@ -487,9 +502,21 @@ def handle_update_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_delete_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    """일정 삭제 핸들러"""
+    """
+    일정 삭제
 
-    # ✅ 먼저 캐시된 확정 요청인지 확인 (우선순위 최상위)
+    - 첫번째 호출(confirmed=False): 삭제 대상 미리보기 + 확인 유도
+    - 두번째 호출(confirmed=True): 실제 삭제 진행(캐시에 저장된 타겟 기준)
+
+    :param sid: 세션 ID
+    :type sid: str
+    :param args: where/index/indexes/id/ids/confirmed 등
+    :type args: Dict[str, Any]
+    :return: actions 배열(need_confirm/deleted 등)
+    :rtype: Dict[str, Any]
+    """
+
+    # 1) (확정단계) 캐시에 삭제 후보가 있으면 실제 삭제 진행
     if args.get("confirmed", False):
         cached = SESSION_PENDING_DELETE.get(sid) or []
         if cached:
@@ -507,6 +534,7 @@ def handle_delete_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
             refresh_session_cache(sid)  # 캐시 새로고침
             return {"actions": actions}
 
+    # 세션에 저장된 마지막 목록의 N번째를 (id, cal_id)로 변환하는 헬퍼
     def idx_to_pair_local(i: int):
         pairs = SESSION_LAST_LIST.get(sid) or []
         if 1 <= i <= len(pairs):
@@ -515,7 +543,7 @@ def handle_delete_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
     targets: List[Tuple[str, str]] = []
 
-    # where 조건으로 찾기
+    # 2) where 조건으로 찾기(여러 개면 확인부터함)
     candidates: List[dict] = []
     if args.get("where"):
         w = args.get("where") or {}
@@ -537,7 +565,7 @@ def handle_delete_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 }]
             }
 
-    # index/id로 찾기
+    # 3) index/id로 지정된 경우
     if args.get("indexes"):
         for i in args["indexes"]:
             p = idx_to_pair_local(int(i))
@@ -561,7 +589,7 @@ def handle_delete_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if not targets:
         return {"actions": [{"ok": False, "error": "not_found"}]}
 
-    # 미리보기 단계 (confirmed=false인 경우만)
+    # 4) 미리보기 단계 -> 삭제 후보들을 캐시에 저장하고 확인 요청
     if not args.get("confirmed", False):
         preview_items: List[dict] = []
         for eid, cal in targets:
@@ -578,11 +606,22 @@ def handle_delete_event(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
             }]
         }
 
-    # 여기까지 올 일은 없어야 함 (confirmed=true면 위에서 처리됨)
+    # confirmed=True는 함수 초반에서 처리하므로 여기까지 도달하면 비정상이라는 것임
     return {"actions": [{"ok": False, "error": "unexpected_state"}]}
 
+
 def handle_get_event_detail(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    """일정 상세 조회 핸들러"""
+    """
+    일정 상세 조회
+
+    :param sid: 세션 ID
+    :type sid: str
+    :param args: id/index/where 중 하나로 대상을 지정함
+    :type args: Dict[str, Any]
+    :return: {"actions": [{"detail": {...}}]} 또는 에러
+    :rtype: Dict[str, Any]
+    """
+
     event_id = None
     cal_id = None
     matched: List[dict] = []
@@ -616,7 +655,17 @@ def handle_get_event_detail(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_get_event_detail_by_index(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    """인덱스로 일정 상세 조회 핸들러"""
+    """
+    인덱스 기반 일정 상세 조회
+
+    :param sid: 세션 ID
+    :type sid: str
+    :param args: {"index": N}
+    :type args: Dict[str, Any]
+    :return: {"actions": [{"detail": {...}}]} 또는 에러
+    :rtype: Dict[str, Any]
+    """
+
     idx = int(args["index"])
     pair = _map_index_to_pair(sid, idx)
     if not pair:
@@ -630,7 +679,17 @@ def handle_get_event_detail_by_index(sid: str, args: Dict[str, Any]) -> Dict[str
 
 
 def handle_start_edit(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    """편집 시작 핸들러"""
+    """
+    편집 시작(클라이언트에서 상세를 띄우기 위한 사전 조회)
+
+    :param sid: 세션 ID
+    :type sid: str
+    :param args: index/id/where 중 하나로 대상 지정
+    :type args: Dict[str, Any]
+    :return: {"actions": [{"detail": {...}, "ok": True}]} 또는 에러
+    :rtype: Dict[str, Any]
+    """
+
     event_id = None
     cal_id = None
     matched: List[dict] = []
@@ -661,19 +720,35 @@ def handle_start_edit(sid: str, args: Dict[str, Any]) -> Dict[str, Any]:
             return {"actions": [{"ok": False, "error": "not_found"}]}
 
 
+# 라우터 엔드포인트
 @router.post("/chat", response_model=ChatOut)
 def chat(input: ChatIn):
-    """개선된 채팅 엔드포인트 - 다단계 도구 실행 지원"""
+    """
+    개선된 채팅 엔드포인트(다단계 도구 실행 지원)
+
+    동작 개요
+    - 시스템 프롬프트 구성(정책/현재시각/자연어 날짜 등 포함)
+    - 대화 히스토리에 유저 메시지 추가
+    - 세션별 도구 핸들러 생성
+    - LLM을 다단계 실행기로 호출(_openai_chat_multi_step) -> 도구 호출/미리보기/확정/알림선택 등 플로우 자동 처리
+
+    :param input: 사용자 입력(문장/이전 히스토리/세션 ID)
+    :type input: ChatIn
+    :raises HTTPException: Google Calendar 미연동 시 401(내부 _must_google_connected)
+    :return: (reply: 사용자용 요약 멘트, tool_result: 프론트용 액션 번들)
+    :rtype: ChatOut
+    """
     sid = (input.session_id or "").strip()
     _must_google_connected(sid)
 
-    # 시스템 프롬프트 적용
+    # 시스템 프롬프트(정책 + 현재 시각/날짜 표현치환)
     system_prompt = (
         SYSTEM_POLICY_TEMPLATE
         .replace("{NOW_ISO}", _now_kst_iso())
         .replace("{TODAY_FRIENDLY}", _friendly_today())
     )
 
+    # LLM 대화 히스토리 구성
     msgs = [{"role": "system", "content": system_prompt}]
     if input.history:
         msgs += input.history
@@ -682,7 +757,7 @@ def chat(input: ChatIn):
     # 도구 핸들러 생성
     tool_handler = create_tool_handler(sid)
 
-    # 다단계 실행
+    # 다단계 실행(도구 호출 -> 미리보기 -> 확인 -> 실제 반영)
     try:
         reply, tool_result = _openai_chat_multi_step(msgs, sid, tool_handler)
         return ChatOut(reply=reply, tool_result=tool_result)

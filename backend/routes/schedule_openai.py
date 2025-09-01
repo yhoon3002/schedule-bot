@@ -1,7 +1,9 @@
-# routes/schedule_openai.py
 # OpenAI 호출 - 다중 도구 호출 지원
 
-import os, requests, logging, json
+import os
+import json
+import logging
+import requests
 from typing import Dict, List, Any, Optional, Tuple
 from fastapi import HTTPException
 from routes.schedule_spec import TOOLS_SPEC
@@ -15,21 +17,20 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE = os.getenv("OPENAI_BASE", "https://api.openai.com/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# 전역 로거 레벨을 DEBUG로 설정
 logging.getLogger().setLevel(logging.DEBUG)
 
 class MultiStepToolExecutor:
     """
-    복합 작업을 위한 '다단계 도구 실행기' 클래스.
-
-    모델이 필요하다고 판단한 '도구(function tool)'들을 실제로 호출하고,
-    그 결과를 다시 대화 히스토리에 추가하여 연쇄적인 처리(예: A 삭제 -> B 생성)를 한 번의 사용자 요청으로 수행할 수 있게 도움
+    복합 작업을 위한 다단계 도구 실행기 클래스
+    모델이 필요하다고 판단한 도구(function_tool)들을 실제로 호출하고,
+    그 결과를 다시 대화 히스토리에 추가하여 연쇄적인 처리(예: A 삭제 -> B 생성)를 한번의 사용자 요청으로 수행하도록 도움.
 
     :param session_id: 세션 식별자(사용자/세션별 상태 식별에 사용)
     :type session_id: str
-    :param tool_handler: 실제 도구를 실행하는 콜백 함수. (function_name, args) -> dict
+    :param tool_handler: 실제 도구를 실행하는 콜백 함수 (function_name, args) -> dict 형태로 결과를 반환해야 함
     :type tool_handler: Callable[[str, Dict[str, Any]], Dict[str, Any]]
     """
+
 
     def __init__(self, session_id: str, tool_handler):
         """
@@ -45,14 +46,15 @@ class MultiStepToolExecutor:
         self.conversation_history = [] # LLM에게 보낼 대화 히스토리
         self.max_iterations = 10  # 무한 루프 방지
 
+
     def execute_conversation(self, messages: List[Dict[str, Any]]) -> Tuple[str, Optional[Any]]:
         """
-        대화형 방식으로 여러 도구를 순차 실행 :
-        1) 현재 히스토리를 LLM에 전달하여 응답을 받음
-        2) 응답에 포함된 tool_calls를 실제로 실행
-        3) 결과를 히스토리에 'tool' 역할로 추가
-        4) 사용자 확인 필요(need_confirm 등) 시 그 지점에서 종료 & 요약 응답 생성
-        5) 추가 확인이 없다면 다음 루프로 넘어가 연쇄 도구 호출을 이어감
+        대화형 방식으로 여러 도구를 순차 실행함
+            1) 현재 히스토리를 LLM에 전달하여 응답을 받음
+            2) 응답에 포함된 tool_calls를 실제로 실행
+            3) 결과를 히스토리에 'tool' 역할로 추가
+            4) 사용자 확인 필요(need_confirm 등) 시 그 지점에서 종료 & 요약 응답 생성
+            5) 추가 확인이 없다면 다음 루프로 넘어가 연쇄 도구 호출을 이어감
 
         :param messages: LLM에 전달할 전체 대화 히스토리(시스템/유저/어시스턴트/툴 메시지)
         :type messages: List[Dict[str, Any]]
@@ -69,35 +71,41 @@ class MultiStepToolExecutor:
             choice = response["choices"][0]
             message = choice["message"]
 
+            # LLM 응답을 히스토리에 추가(이후 tool_calls 처리)
             self.conversation_history.append(message)
 
             tool_calls = message.get("tool_calls", [])
 
+            # 툴 호출이 없다면 자연어 응답을 그대로 반환함
             if not tool_calls:
                 content = message.get("content", "")
                 return self._sanitize_reply(content), None
 
             all_results = []
-            has_mutation = False
             need_user_confirmation = False
+            # create/updated/deleted 중 하나라도 있으면 True
+            has_mutation = False
 
             for tool_call in tool_calls:
+                # 단일 도구 실행
                 result = self._execute_single_tool(tool_call)
                 all_results.append(result)
 
-                # 변경 작업인지 확인
+                # 변경 작업 여부/사용자 확인 필요 여부 점검
                 tool_name = tool_call["function"]["name"]
                 if tool_name in ["create_event", "update_event", "delete_event"]:
                     actions = result.get("actions", [])
                     for action in actions:
+                        # 실제 변경 발생(만들기/수정/삭제) 체크
                         if action.get("created") or action.get("updated") or action.get("deleted"):
                             has_mutation = True
-                        # 사용자 확인이 필요한 상황인지 체크
+                        # 사용자 상호작용(확인/선택/인덱스 지정) 필요 체크
                         if (action.get("need_confirm") or
                                 action.get("need_notify_choice") or
                                 action.get("need_index")):
                             need_user_confirmation = True
 
+                # 도구 결과를 tool 역할 메시지로 히스토리에 넣어 LLM이 이어서 참고할 수 있게 함
                 self.conversation_history.append({
                     "tool_call_id": tool_call["id"],
                     "role": "tool",
@@ -105,11 +113,14 @@ class MultiStepToolExecutor:
                     "content": json.dumps(result, ensure_ascii=False)
                 })
 
-            # 핵심 수정: 사용자 확인이 필요하거나 변경이 완료된 경우 즉시 종료
+            # 종료 조건
+            # 1) 사용자 확인이 필요한 경우: 그 자리에서 요약을 만들어 사용자에게 전달
+            # 2) 실제 변경이 완료된 경우: 추가 도구 호출 없이 바로 요약을 만들어 전달
             if need_user_confirmation:
                 return self._generate_final_response(), {"actions": self._collect_all_actions(all_results)}
-
             continue
+
+            # 이 외의 경우(예: 조회만 하고 LLM이 후속 판단을 해야 하는 단계는 다음 반복(iteration)으로 넘어가 또 한 번 LLM에게 결정을 맡김.
 
             ##### Dead Code #####
             # 확인이 필요한 경우 즉시 종료
@@ -137,9 +148,10 @@ class MultiStepToolExecutor:
             # if all_completed:
             #     return self._generate_final_response(), {"actions": self._collect_all_actions(all_results)}
 
-        # 최대 반복 횟수 초과
+        # 최대 반복 횟수 초과(비정상 루프 등)
         logging.warning(f"Max iterations ({self.max_iterations}) exceeded for session {self.session_id}")
         return "작업이 복잡해서 완료하지 못했습니다. 단계별로 나누어 요청해 주세요.", None
+
 
     def _call_openai(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -151,12 +163,12 @@ class MultiStepToolExecutor:
         :return: OpenAI API의 원본 응답(JSON dict)
         :rtype: Dict[str, Any]
         """
+
         if not OPENAI_API_KEY:
             raise HTTPException(500, "OPENAI_API_KEY not set")
 
         try:
             last_user = next((m for m in messages[::-1] if m["role"] == "user"), {})
-
             logging.debug(
                 f"[LLM] req: iteration={len([m for m in messages if m.get('role') == 'assistant'])}, user='{last_user.get('content', '')[:]}...'")
         except Exception:
@@ -184,7 +196,6 @@ class MultiStepToolExecutor:
 
         data = r.json()
 
-        # 응답 로깅
         try:
             msg = data.get("choices", [{}])[0].get("message", {})
             tools = msg.get("tool_calls", [])
@@ -196,6 +207,7 @@ class MultiStepToolExecutor:
             pass
 
         return data
+
 
     def _execute_single_tool(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -234,6 +246,7 @@ class MultiStepToolExecutor:
                 }]
             }
 
+
     def _collect_all_actions(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         여러 도구 실행 결과에서 actions를 전부 모아 하나의 리스트로 반환함.
@@ -247,6 +260,7 @@ class MultiStepToolExecutor:
         for result in results:
             all_actions.extend(result.get("actions", []))
         return all_actions
+
 
     def _generate_final_response(self) -> str:
         """
@@ -270,6 +284,7 @@ class MultiStepToolExecutor:
         except Exception as e:
             logging.error(f"Failed to generate final response: {e}")
             return "작업이 완료되었습니다."
+
 
     def _sanitize_reply(self, text: str) -> str:
         """

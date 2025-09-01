@@ -1,4 +1,7 @@
-# routes/google_calendar.py
+# Google Calendar API 래퍼 모듈
+# - access_token 갱신/헤더 구성
+# - 캘린더/이벤트 조회/생성/수정/삭제
+# - LLM 도구 핸들러들이 직접 이 함수를 호출함
 import logging, requests
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
@@ -21,6 +24,7 @@ _EVENT_TYPES_NO_BIRTHDAY = [
     "focusTime",
 ]
 
+
 def _auth_header(session_id: str) -> Dict[str, str]:
     """
     세션 토큰을 새로고침하여 Authorization 헤더를 만든다.
@@ -31,10 +35,12 @@ def _auth_header(session_id: str) -> Dict[str, str]:
     :rtype: Dict[str, str]
     :raises HTTPException: 401 - 미연결 또는 리프레시 실패
     """
-    # 마료 확인 및 필요 시 refresh_token 사용해 갱싱
+
+    # 토큰 만료 확인 및 필요 시 refresh_token 사용해 갱싱
     tok = _refresh(session_id)
     # Google API 호출에 필요한 Bearer 헤더 구성
     return {"Authorization": f"Bearer {tok['access_token']}"}
+
 
 def _rfc3339(dt: datetime) -> str:
     """
@@ -53,9 +59,13 @@ def _rfc3339(dt: datetime) -> str:
         .replace("+00:00", "Z")
     )
 
+
 def _normalize_rfc3339(s: Optional[str]) -> Optional[str]:
     """
     시간 문자열에 타임존이 없으면 'Z'를 덧붙여 RFC3339로 정규화한다.
+
+    # - 이미 'Z' 또는 타임존 오프셋(+09:00/-08:00 등)이 포함되어 있으면 그대로 사용
+    # - 없으면 UTC로 간주하여 'Z'를 붙임
 
     :param s: 타임존 포함 여부가 불명확한 문자열
     :type s: Optional[str]
@@ -65,11 +75,11 @@ def _normalize_rfc3339(s: Optional[str]) -> Optional[str]:
 
     if not s:
         return None
-    # `Z` 또는 offset(+09:00 등)이 있으면 그대로 사용
+    # 날짜 부분의 '-'와 구분하기 위해 보통 타임존이 나타나는 'T' 이후에서 오프셋을 검사함
     if "Z" in s or "+" in s or "-" in s[11:]:
         return s
-    # 없으면 UTC 가정
     return s + "Z"
+
 
 # 캘린더/이벤트 ID를 URL 경로 세그먼트로 안전 인코딩
 def _cid(s: str) -> str:
@@ -84,6 +94,7 @@ def _cid(s: str) -> str:
 
     return quote(s, safe='@._-+%')
 
+
 def _eid(s: str) -> str:
     """
     이벤트 ID를 URL 경로 세그먼트로 안전하게 인코딩한다.
@@ -96,9 +107,10 @@ def _eid(s: str) -> str:
 
     return quote(s, safe='@._-+%')
 
+
 def gcal_list_calendar_list(session_id: str) -> List[Dict[str, Any]]:
     """
-    사용자의 캘린더 목록(calendarList)을 조회한다. 'selected'가 표시된 캘린더가 있으면 우선 사용한다.
+    사용자의 캘린더 목록(calendarList)을 조회함. 'selected'가 표시된 캘린더가 있으면 우선 사용함.
 
     :param session_id: 인증에 사용할 세션 ID
     :type session_id: str
@@ -141,7 +153,7 @@ def _cal_type(cal: Dict[str, Any]) -> str:
         return "birthday"
     return "normal"
 
-# 개별 캘린더 이벤트 조회
+
 def _list_events_for_calendar(
     session_id: str,
     calendar_id: str,
@@ -152,6 +164,7 @@ def _list_events_for_calendar(
 ) -> List[Dict[str, Any]]:
     """
     단일 캘린더의 이벤트를 조회한다. 단일 인스턴스 전개(singleEvents) + 시작시간 정렬
+
     :param session_id: 인증용 세션 ID
     :type session_id: str
     :param calendar_id: 대상 캘린더 ID (예: 'primary')
@@ -193,13 +206,14 @@ def _list_events_for_calendar(
         logger.error("List events failed(%s) cid=%s | %s", r.status_code, calendar_id, r.text)
         raise HTTPException(502, "Google Calendar list failed")
     items = r.json().get("items", [])
-    # 혹시라도 섞여 들어온 birthday 타입을 한 번 더 필터링
+    # 혹시라도 섞여 들어온 birthday 타입을 한 번 더 필터링함
     if not include_birthdays:
         items = [it for it in items if it.get("eventType") != "birthday"]
     # 이후 처리에서 캘린더 출처를 알 수 있게 주석 필드 추가
     for it in items:
         it["_calendarId"] = calendar_id
     return items
+
 
 def gcal_list_events_all(
     session_id: str,
@@ -228,6 +242,7 @@ def gcal_list_events_all(
     :return: 통합 이벤트 리스트
     :rtype: List[Dict[str, Any]]
     """
+
     # 범위가 전혀 없을 때 합리적인 기본창(오늘 ~ 연말)을 잡아준다
     if not time_min and not time_max:
         now_kst = datetime.now(KST)
@@ -279,6 +294,7 @@ def gcal_list_events_all(
     all_items.sort(key=_start_key)
     return all_items
 
+
 def gcal_get_event(session_id: str, calendar_id: str, event_id: str) -> Dict[str, Any]:
     """
     단일 이벤트를 조회한다.
@@ -306,6 +322,7 @@ def gcal_get_event(session_id: str, calendar_id: str, event_id: str) -> Dict[str
     item = r.json()
     item["_calendarId"] = calendar_id
     return item
+
 
 def _norm_attendees_for_write(v):
     """
@@ -339,6 +356,7 @@ def _norm_attendees_for_write(v):
                 out.append(item)
     return out
 
+
 def gcal_insert_event(
     session_id: str,
     body: Dict[str, Any],
@@ -362,8 +380,9 @@ def gcal_insert_event(
     """
 
     headers = _auth_header(session_id)
-    b = dict(body) # 원본 훼손 방지
-    # sumaary 필드 표준화(title 키와 혼용될 수 있음)
+    # 원본 훼손 방지
+    b = dict(body)
+    # summary/title 혼용 대응
     summary = b.get("summary") or b.get("title") or "(제목 없음)"
     start = b.get("start")
     end = b.get("end")
@@ -373,6 +392,7 @@ def gcal_insert_event(
         start = {"dateTime": start}
     if isinstance(end, str):
         end = {"dateTime": end}
+
     # Google API에 맞는 payload 구성(+ TZ 정규화)
     payload = {
         "summary": summary,
@@ -406,6 +426,7 @@ def gcal_insert_event(
     item = r.json()
     item["_calendarId"] = calendar_id
     return item
+
 
 def gcal_patch_event(
     session_id: str,
@@ -497,6 +518,7 @@ def gcal_patch_event(
     logger.error("Patch event failed: %s | %s", r.status_code, r.text)
     raise HTTPException(502, "Google Calendar update failed")
 
+
 def gcal_delete_event(
     session_id: str, event_id: str, calendar_id: str = "primary"
 ) -> None:
@@ -522,7 +544,8 @@ def gcal_delete_event(
         logger.error("Delete event failed: %s | %s", r.status_code, r.text)
         raise HTTPException(502, "Google Calendar delete failed")
 
-### (테스트용) REST 핸들러
+
+# (테스트용) REST 핸들러
 @router.get("/events")
 def list_events(
     session_id: str = Query(...),
@@ -555,6 +578,7 @@ def list_events(
     logger.info("[GCAL] REST /events -> %d items", len(items))
     return {"items": items}
 
+
 @router.get("/events/{event_id}")
 def get_event(
     event_id: str,
@@ -575,6 +599,7 @@ def get_event(
     """
 
     return gcal_get_event(session_id, calendar_id, event_id)
+
 
 @router.post("/events")
 def create_event(
@@ -600,6 +625,7 @@ def create_event(
 
     item = gcal_insert_event(session_id, body, calendar_id, send_updates)
     return item
+
 
 @router.patch("/events/{event_id}")
 def patch_event(
@@ -629,6 +655,7 @@ def patch_event(
     item = gcal_patch_event(session_id, event_id, body, calendar_id, send_updates)
     return item
 
+
 @router.put("/events/{event_id}")
 def put_event(
     event_id: str,
@@ -656,6 +683,7 @@ def put_event(
 
     item = gcal_patch_event(session_id, event_id, body, calendar_id, send_updates)
     return item
+
 
 @router.delete("/events/{event_id}")
 def delete_event(
